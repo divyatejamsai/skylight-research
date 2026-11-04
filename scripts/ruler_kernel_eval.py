@@ -60,6 +60,7 @@ def main(
     block_size: int = 64,
     sink_tokens: int = 128,
     local_tokens: int = 128,
+    tail_rho: float = 0.6,
     out: str = "",
 ) -> None:
     tok = AutoTokenizer.from_pretrained(model)
@@ -107,7 +108,8 @@ def main(
                     math.ceil(local_tokens / block_size),
                     (layer_pre, layer_post),
                 )
-                loop.track_density = name in ("sparse", "two_stage", "two_stage_u")
+                loop.track_density = name.startswith(("sparse", "two_stage"))
+                loop.tail_rho = tail_rho
                 if len(vals) > 3:
                     loop.prefilter = vals[3]
                 if len(vals) > 4:

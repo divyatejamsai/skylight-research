@@ -1,5 +1,7 @@
 """Correctness and latency of the block-sparse decode kernel against dense attention.
 
+  check_tail: quest+mean prefilter block sets and the tail-estimate attention vs torch
+         references, and the running block K/V sums of append_kv.
   check: kernel output vs masked dense attention (fp32 reference) for the same selection,
          and the all-blocks kernel vs torch SDPA.
   bench: per-layer decode attention latency (one token, Qwen3-4B shapes: 32 q / 8 kv heads,
@@ -25,12 +27,14 @@ from sparse_attention_hub.kernels.block_sparse_decode import (
     block_min_max,
     block_sparse_decode,
     block_sparse_decode_fused,
+    block_sums,
     dense_block_index,
     quantize_keys,
     select_blocks,
     select_blocks_fused,
     select_blocks_two_stage,
     select_blocks_two_stage_ref,
+    two_stage_tail_ref,
 )
 
 HQ, HKV, D = 32, 8, 128
@@ -269,6 +273,108 @@ def check_two_stage(block_size: int = 64, n: int = 32768 + 37, seed: int = 0) ->
     )
 
 
+def check_tail(block_size: int = 64, n: int = 32768 + 37, seed: int = 0) -> None:
+    """Quest+mean prefilter and tail-estimate attention vs the torch references."""
+    torch.manual_seed(seed)
+    dev = "cuda"
+    B, G = 2, HQ // HKV
+    q = torch.randn(B, HQ, D, device=dev, dtype=torch.bfloat16) * (2.0 / math.sqrt(D))
+    k = torch.randn(B, HKV, n, D, device=dev, dtype=torch.bfloat16)
+    v = torch.randn(B, HKV, n, D, device=dev, dtype=torch.bfloat16)
+    k += 0.5 * torch.randn(1, HKV, 1, D, device=dev, dtype=torch.bfloat16)  # key bias
+    for j, pos in enumerate((3000, 9000, 20000)):
+        k[:, :, pos : pos + 40] += (
+            2.5 * math.sqrt(D) * q.view(B, HKV, G, D)[:, :, j % G : j % G + 1]
+        )
+    kmin, kmax = block_min_max(k, block_size)
+    ksum, vsum = block_sums(k, block_size), block_sums(v, block_size)
+    k8, ks = quantize_keys(k)
+    seq = torch.full((1,), n, device=dev, dtype=torch.int32)
+    for cdf, pre, sh, rho, t1, t2 in (
+        (0.9, 0.25, True, 0.6, True, True),
+        (0.95, 0.15, True, 0.2, True, True),
+        (0.9, 0.25, False, 0.6, True, True),
+        (0.8, 0.25, True, 1.01, True, False),
+        (0.8, 0.25, True, 0.6, False, True),
+    ):
+        args = (q, kmin, kmax, k8, ks, block_size, cdf, 0.02, 0.15, pre, 2, 2)
+        ri, rc, rcand = select_blocks_two_stage_ref(
+            *args,
+            seq_len=seq,
+            prefilter_shared=sh,
+            ksum=ksum,
+            prefilter_mean=True,
+            return_cand=True,
+        )
+        fi, fc, aux = select_blocks_two_stage(
+            *args,
+            seq_len=seq,
+            prefilter_shared=sh,
+            ksum=ksum,
+            prefilter_mean=True,
+            return_aux=True,
+        )
+        rs, fs = _as_sets(ri, rc), _as_sets(fi, fc)
+        fcand = torch.zeros_like(rcand)
+        for bi in range(B):
+            for h in range(HKV):
+                c = aux["cand"][bi, h, : aux["ncand"][bi, h]].long()
+                fcand[bi, h, c] = True
+        tail = dict(aux=aux, vsum=vsum, rho=rho, t1=t1, t2=t2)
+        out = block_sparse_decode_fused(
+            q, k, v, fi, fc, block_size, seq_len=seq, tail=tail
+        )
+        ref = two_stage_tail_ref(
+            q, k, v, k8, ks, ksum, vsum, fi, fc, fcand, block_size, rho, seq, t1, t2
+        )
+        plain = block_sparse_decode_fused(q, k, v, fi, fc, block_size, seq_len=seq)
+        dense = (
+            F.scaled_dot_product_attention(
+                q.unsqueeze(2), k, v, scale=1.0, enable_gqa=True
+            )
+            .squeeze(2)
+            .float()
+        )
+
+        def rel(o):
+            return ((o.float() - dense).norm(dim=-1) / dense.norm(dim=-1)).mean().item()
+
+        print(
+            f"cdf={cdf} pre={pre} shared={sh} rho={rho} t1={t1} t2={t2}: "
+            f"cand sym-diff={int((rcand != fcand).sum())} blocks sym-diff="
+            f"{sum(len(a ^ b) for a, b in zip(rs, fs))} | tail max|err| vs ref="
+            f"{(out.float() - ref).abs().max():.2e} | rel err vs dense: plain "
+            f"{rel(plain):.4f} tail {rel(out):.4f}"
+        )
+    # Running sums: append the last token of a block into sums built without it.
+    p_last = (n - 1) // block_size
+    ksb, vsb = block_sums(k[:, :, : n - 1], block_size), block_sums(
+        v[:, :, : n - 1], block_size
+    )
+    if ksb.shape[2] < ksum.shape[2]:
+        ksb = torch.nn.functional.pad(ksb, (0, 0, 0, 1))
+        vsb = torch.nn.functional.pad(vsb, (0, 0, 0, 1))
+    kmn, kmx = kmin.clone(), kmax.clone()
+    kb, vb = k.clone(), v.clone()
+    append_kv(
+        k[:, :, n - 1],
+        v[:, :, n - 1],
+        kb,
+        vb,
+        torch.full((1,), n - 1, device=dev, dtype=torch.long),
+        kmn,
+        kmx,
+        block_size,
+        ksb,
+        vsb,
+    )
+    print(
+        f"append sums: block {p_last} max|dK|={(ksb - ksum).abs().max():.1e} "
+        f"max|dV|={(vsb - vsum).abs().max():.1e} kmin/kmax exact="
+        f"{torch.equal(kmn, kmin) and torch.equal(kmx, kmax)}"
+    )
+
+
 def bench(
     ctx: List[int] = (32768, 65536, 131072),
     batch: List[int] = (1, 8),
@@ -327,6 +433,7 @@ if __name__ == "__main__":
             "check": check,
             "check_fused": check_fused,
             "check_two_stage": check_two_stage,
+            "check_tail": check_tail,
             "bench": bench,
         }
     )

@@ -23,6 +23,14 @@ import triton
 import triton.language as tl
 
 
+def block_sums(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Per-block fp32 sums of x [B, H, N, D] over tokens -> [B, H, ceil(N / bs), D]."""
+    B, H, N, D = x.shape
+    pad = (-N) % block_size
+    xp = torch.nn.functional.pad(x.float(), (0, 0, 0, pad))
+    return xp.view(B, H, -1, block_size, D).sum(3)
+
+
 def block_min_max(
     keys: torch.Tensor, block_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -316,6 +324,8 @@ def _block_scores_kernel(
     KMIN,
     KMAX,
     S,
+    KSUM,
+    S2,
     NPTR,
     stride_qb,
     stride_qh,
@@ -331,6 +341,7 @@ def _block_scores_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_P: tl.constexpr,
     D: tl.constexpr,
+    MEAN: tl.constexpr = False,
 ):
     pid_bh = tl.program_id(0)
     b = (pid_bh // HKV).to(tl.int64)
@@ -358,6 +369,21 @@ def _block_scores_kernel(
         s,
         mask=row_ok[:, None] & (offs_p[None, :] < P),
     )
+    if MEAN:
+        # q . block-mean key (SpargeAttn's block score); the last block may be partial.
+        n_tok = tl.minimum(BS, tl.load(NPTR) - offs_p * BS).to(tl.float32)
+        ksm = tl.load(KSUM + kp, mask=p_ok[:, None], other=0.0)
+        kmean = (ksm / tl.maximum(n_tok, 1.0)[:, None]).to(kmx.dtype)
+        s2 = tl.dot(q.to(kmx.dtype), tl.trans(kmean))
+        s2 = tl.where(p_ok[None, :], s2, float("-inf"))
+        tl.store(
+            S2
+            + b * stride_sb
+            + (h * G + offs_m)[:, None] * stride_sh
+            + offs_p[None, :],
+            s2,
+            mask=row_ok[:, None] & (offs_p[None, :] < P),
+        )
 
 
 @triton.jit
@@ -478,6 +504,8 @@ def select_blocks_fused(
         kmin,
         kmax,
         scores,
+        kmin,
+        scores,
         seq_len,
         q.stride(0),
         q.stride(1),
@@ -532,6 +560,8 @@ def _append_kernel(
     VBUF,
     KMIN,
     KMAX,
+    KSUM,
+    VSUM,
     POS,
     stride_nb,
     stride_nh,
@@ -545,6 +575,7 @@ def _append_kernel(
     BS,
     D: tl.constexpr,
     META: tl.constexpr,
+    SUMS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     b = (pid // HKV).to(tl.int64)
@@ -564,19 +595,41 @@ def _append_kernel(
         else:
             tl.store(KMIN + mp, tl.minimum(tl.load(KMIN + mp), k))
             tl.store(KMAX + mp, tl.maximum(tl.load(KMAX + mp), k))
+    if SUMS:
+        sp = b * stride_mb + h * stride_mh + (pos // BS) * stride_mp + offs_d
+        if pos % BS == 0:
+            tl.store(KSUM + sp, k.to(tl.float32))
+            tl.store(VSUM + sp, v.to(tl.float32))
+        else:
+            tl.store(KSUM + sp, tl.load(KSUM + sp) + k.to(tl.float32))
+            tl.store(VSUM + sp, tl.load(VSUM + sp) + v.to(tl.float32))
 
 
 def append_kv(
-    k_new, v_new, k_buf, v_buf, pos, kmin=None, kmax=None, block_size: int = 64
+    k_new,
+    v_new,
+    k_buf,
+    v_buf,
+    pos,
+    kmin=None,
+    kmax=None,
+    block_size: int = 64,
+    ksum=None,
+    vsum=None,
 ) -> None:
     """Write one decode token's K/V ([B, Hkv, D] or [B, Hkv, 1, D]) at position pos (device
-    scalar) and, when kmin/kmax are given, fold it into its block's channel min/max."""
+    scalar) and, when kmin/kmax are given, fold it into its block's channel min/max (and,
+    when ksum/vsum [B, Hkv, P, D] fp32 are given, into its block's K and V sums)."""
     B, Hkv = k_buf.shape[0], k_buf.shape[1]
     k_new = k_new.reshape(B, Hkv, -1).contiguous()
     v_new = v_new.reshape(B, Hkv, -1).contiguous()
     meta = kmin is not None
+    sums = ksum is not None
     if not meta:
         kmin = kmax = k_buf
+    if not sums:
+        ksum = vsum = kmin
+    assert not (sums and meta) or ksum.stride() == kmin.stride()
     _append_kernel[(B * Hkv,)](
         k_new,
         v_new,
@@ -584,6 +637,8 @@ def append_kv(
         v_buf,
         kmin,
         kmax,
+        ksum,
+        vsum,
         pos,
         k_new.stride(0),
         k_new.stride(1),
@@ -597,6 +652,7 @@ def append_kv(
         block_size,
         D=k_buf.shape[-1],
         META=meta,
+        SUMS=sums,
     )
 
 
@@ -643,10 +699,132 @@ def _merge_kernel(
     tl.store(OUT + b * stride_ob + h * stride_oh + offs_d, out.to(OUT.dtype.element_ty))
 
 
-def block_sparse_decode_fused(
-    q, k, v, block_idx, counts, block_size, num_splits=None, seq_len=None
+@triton.jit
+def _tail_kernel(
+    S2,
+    ISC,
+    L,
+    PK,
+    CAND,
+    NCAND,
+    KEPT,
+    VSUM,
+    NPTR,
+    O_ACC,
+    O_M,
+    O_L,
+    stride_sb,
+    stride_sh,
+    stride_cb,
+    stride_ch,
+    stride_vb,
+    stride_vh,
+    stride_vp,
+    stride_ab,
+    stride_ah,
+    stride_as,
+    stride_mb,
+    stride_mh,
+    stride_ms,
+    HKV,
+    BS,
+    SPLIT0,
+    NT2,
+    log_rho,
+    G: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    D: tl.constexpr,
 ):
-    """block_sparse_decode with the split merge as one Triton kernel instead of torch ops."""
+    # Extra split-K partials, one per tile of BLOCK_T blocks: every unselected block enters
+    # as a single pseudo-token with the block-mean value and an estimated block weight, so
+    # the softmax denominator keeps the dropped mass. Tiles [0, NT2) cover T2 (blocks the
+    # prefilter dropped; weight = q . mean key + log(block length)); the rest cover T1
+    # (candidate slots not kept; weight = exact int8 block mass, only when no token holds
+    # more than rho of it).
+    pid = tl.program_id(0)
+    tile = tl.program_id(1)
+    b = (pid // HKV).to(tl.int64)
+    h = pid % HKV
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    row_ok = offs_m < G
+    rows = h * G + offs_m
+    N = tl.load(NPTR)
+    v_base = VSUM + b * stride_vb + h * stride_vh
+    if tile < NT2:
+        offs = tile * BLOCK_T + tl.arange(0, BLOCK_T)
+        ok = offs < (N + BS - 1) // BS
+        isc = tl.load(ISC + b * stride_cb + h * stride_ch + offs, mask=ok, other=1)
+        use = ok & (isc == 0)
+        logw = tl.load(
+            S2 + b * stride_sb + rows[:, None] * stride_sh + offs[None, :],
+            mask=row_ok[:, None] & use[None, :],
+            other=float("-inf"),
+        )
+        blk = offs
+        n_tok = tl.maximum(tl.minimum(BS, N - blk * BS), 1).to(tl.float32)
+        logw = tl.where(use[None, :], logw + tl.log(n_tok)[None, :], float("-inf"))
+    else:
+        offs = (tile - NT2) * BLOCK_T + tl.arange(0, BLOCK_T)
+        ok = offs < tl.load(NCAND + b * HKV + h)
+        kept = tl.load(KEPT + b * stride_cb + h * stride_ch + offs, mask=ok, other=1)
+        use = ok & (kept == 0)
+        rmask = row_ok[:, None] & use[None, :]
+        lse = tl.load(
+            L + b * stride_sb + rows[:, None] * stride_sh + offs[None, :],
+            mask=rmask,
+            other=float("-inf"),
+        )
+        pk = tl.load(
+            PK + b * stride_sb + rows[:, None] * stride_sh + offs[None, :],
+            mask=rmask,
+            other=0.0,
+        )
+        logw = tl.where(rmask & (pk < log_rho), lse, float("-inf"))
+        blk = tl.load(CAND + b * stride_cb + h * stride_ch + offs, mask=use, other=0)
+        n_tok = tl.maximum(tl.minimum(BS, N - blk * BS), 1).to(tl.float32)
+    vm = (
+        tl.load(
+            v_base + blk[:, None] * stride_vp + offs_d[None, :],
+            mask=use[:, None],
+            other=0.0,
+        )
+        / n_tok[:, None]
+    )
+    m_i = tl.max(logw, axis=1)
+    m_safe = tl.where(m_i == float("-inf"), 0.0, m_i)
+    p = tl.exp(logw - m_safe[:, None])
+    acc = tl.dot(p, vm)
+    split = SPLIT0 + tile
+    tl.store(
+        O_ACC
+        + b * stride_ab
+        + rows[:, None] * stride_ah
+        + split * stride_as
+        + offs_d[None, :],
+        acc,
+        mask=row_ok[:, None],
+    )
+    tl.store(
+        O_M + b * stride_mb + rows * stride_mh + split * stride_ms, m_i, mask=row_ok
+    )
+    tl.store(
+        O_L + b * stride_mb + rows * stride_mh + split * stride_ms,
+        tl.sum(p, axis=1),
+        mask=row_ok,
+    )
+
+
+def block_sparse_decode_fused(
+    q, k, v, block_idx, counts, block_size, num_splits=None, seq_len=None, tail=None
+):
+    """block_sparse_decode with the split merge as one Triton kernel instead of torch ops.
+
+    tail: optional dict(aux=<select_blocks_two_stage(..., return_aux=True) aux>,
+    vsum=[B, Hkv, P, D] fp32 block value sums, rho=float, t1=bool, t2=bool). Adds the
+    unselected blocks back as block-mean pseudo-tokens (see _tail_kernel).
+    """
     B, Hq, D = q.shape
     Hkv = k.shape[1]
     G = Hq // Hkv
@@ -659,11 +837,59 @@ def block_sparse_decode_fused(
     bpi = max(1, 64 // block_size)
     per_split = triton.cdiv(triton.cdiv(kmax_sel, num_splits), bpi) * bpi
     num_splits = triton.cdiv(kmax_sel, per_split)
-    acc = torch.empty(B, Hq, num_splits, D, device=q.device, dtype=torch.float32)
-    m = torch.empty(B, Hq, num_splits, device=q.device, dtype=torch.float32)
+    n_tail = 0
+    if tail is not None:
+        bt = 64
+        nt2 = triton.cdiv(tail["vsum"].shape[2], bt) if tail.get("t2", True) else 0
+        nt1 = triton.cdiv(tail["aux"]["max_cand"], bt) if tail.get("t1", True) else 0
+        n_tail = nt2 + nt1
+    n_parts = num_splits + n_tail
+    acc = torch.empty(B, Hq, n_parts, D, device=q.device, dtype=torch.float32)
+    m = torch.empty(B, Hq, n_parts, device=q.device, dtype=torch.float32)
     l_sum = torch.empty_like(m)
     if seq_len is None:
         seq_len = torch.full((1,), k.shape[2], device=q.device, dtype=torch.int32)
+    if n_tail:
+        a, vsum = tail["aux"], tail["vsum"]
+        t2 = tail.get("t2", True)
+        assert not t2 or a["has_s2"], "the T2 tail needs block key sums (ksum)"
+        _tail_kernel[(B * Hkv, n_tail)](
+            a["s2"],
+            a["isc"],
+            a["lse"],
+            a["pk"],
+            a["cand"],
+            a["ncand"],
+            a["kept"],
+            vsum,
+            seq_len,
+            acc,
+            m,
+            l_sum,
+            a["lse"].stride(0),
+            a["lse"].stride(1),
+            a["cand"].stride(0),
+            a["cand"].stride(1),
+            vsum.stride(0),
+            vsum.stride(1),
+            vsum.stride(2),
+            acc.stride(0),
+            acc.stride(1),
+            acc.stride(2),
+            m.stride(0),
+            m.stride(1),
+            m.stride(2),
+            Hkv,
+            block_size,
+            num_splits,
+            nt2,
+            math.log(tail.get("rho", 0.6)),
+            G=G,
+            BLOCK_M=max(16, triton.next_power_of_2(G)),
+            BLOCK_T=bt,
+            D=D,
+            num_warps=4,
+        )
     _sparse_decode_kernel[(B * Hkv, num_splits)](
         q,
         k,
@@ -714,8 +940,8 @@ def block_sparse_decode_fused(
         out.stride(0),
         out.stride(1),
         Hq,
-        NS=num_splits,
-        BLOCK_S=triton.next_power_of_2(num_splits),
+        NS=n_parts,
+        BLOCK_S=triton.next_power_of_2(n_parts),
         D=D,
     )
     return out
@@ -738,7 +964,9 @@ def quantize_keys(k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 @triton.jit
 def _prefilter_kernel(
     S,
+    S2,
     CAND,
+    ISC,
     NCAND,
     NFORCED,
     NPTR,
@@ -755,9 +983,11 @@ def _prefilter_kernel(
     BLOCK_P: tl.constexpr,
     ITERS: tl.constexpr,
     SHARED: tl.constexpr,
+    MEAN: tl.constexpr = False,
 ):
     # SHARED: one top set per KV head from the group-mean bound softmax; otherwise the
-    # union of every query head's own top set.
+    # union of every query head's own top set. MEAN: rank by the average of the bound
+    # softmax and the block-mean-key softmax (S2) instead of the bound alone.
     pid = tl.program_id(0)
     b = (pid // HKV).to(tl.int64)
     h = pid % HKV
@@ -779,6 +1009,15 @@ def _prefilter_kernel(
         lpr = (
             s - mx - tl.log(tl.sum(tl.exp(s - mx), axis=0))
         )  # log-softmax, -inf if invalid
+        if MEAN:
+            s2 = tl.load(
+                S2 + b * stride_sb + (h * G + g) * stride_sh + offs_p,
+                mask=valid,
+                other=float("-inf"),
+            )
+            mx2 = tl.max(s2, axis=0)
+            lpr2 = s2 - mx2 - tl.log(tl.sum(tl.exp(s2 - mx2), axis=0))
+            lpr = _logaddexp(lpr, lpr2) - 0.6931471805599453
         if SHARED:
             lmean = _logaddexp(lmean, lpr)
         else:
@@ -813,6 +1052,11 @@ def _prefilter_kernel(
     )
     tl.store(NCAND + b * HKV + h, n_forced + tl.sum(union.to(tl.int32), axis=0))
     tl.store(NFORCED + b * HKV + h, n_forced)
+    tl.store(
+        ISC + b * stride_cb + h * stride_ch + offs_p,
+        (forced | union).to(tl.int8),
+        mask=valid,
+    )
 
 
 @triton.jit
@@ -823,6 +1067,7 @@ def _block_mass_kernel(
     CAND,
     NCAND,
     L,
+    PK,
     NPTR,
     stride_qb,
     stride_qh,
@@ -878,6 +1123,10 @@ def _block_mass_kernel(
         m = tl.max(s, axis=1)
         lse = m + tl.log(tl.sum(tl.exp(s - m[:, None]), axis=1))
         tl.store(L + b * stride_lb + (h * G + offs_m) * stride_lh + j, lse, mask=row_ok)
+        # log of the share of the block's mass on its top token (0 when one token holds it)
+        tl.store(
+            PK + b * stride_lb + (h * G + offs_m) * stride_lh + j, m - lse, mask=row_ok
+        )
 
 
 @triton.jit
@@ -888,6 +1137,7 @@ def _final_select_kernel(
     NFORCED,
     IDX,
     CNT,
+    KEPT,
     stride_lb,
     stride_lh,
     stride_cb,
@@ -959,6 +1209,11 @@ def _final_select_kernel(
     blk = tl.load(CAND + b * stride_cb + h * stride_ch + offs, mask=valid, other=0)
     tl.store(IDX + b * stride_ib + h * stride_ih + slot, blk, mask=keep & (slot < CAP))
     tl.store(CNT + b * HKV + h, tl.minimum(tl.sum(keep.to(tl.int32), axis=0), CAP))
+    tl.store(
+        KEPT + b * stride_cb + h * stride_ch + offs,
+        (keep & (slot < CAP)).to(tl.int8),
+        mask=valid,
+    )
 
 
 @torch.no_grad()
@@ -977,11 +1232,17 @@ def select_blocks_two_stage(
     local_blocks: int = 8,
     seq_len: Optional[torch.Tensor] = None,
     prefilter_shared: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    ksum: Optional[torch.Tensor] = None,
+    prefilter_mean: bool = False,
+    return_aux: bool = False,
+):
     """Bound prefilter -> int8 block mass on candidates -> TopCdf + floor, per KV head.
 
     q: [B, Hq, D] scaled; kmin/kmax: [B, Hkv, P, D]; k8: [B, Hkv, N, D] int8 and kscale
     [B, Hkv, N] from quantize_keys. Returns block_idx [B, Hkv, cap] int32 and counts.
+    ksum: [B, Hkv, P, D] fp32 block key sums; with it the block-mean-key scores are
+    computed too, and prefilter_mean ranks candidates by the average of the bound and
+    mean-key softmaxes. return_aux also returns the intermediates the tail estimate uses.
     """
     B, Hq, D = q.shape
     Hkv, P = kmin.shape[1], kmin.shape[2]
@@ -994,11 +1255,18 @@ def select_blocks_two_stage(
     bm = max(16, triton.next_power_of_2(G))
     bp = triton.next_power_of_2(P)
     scores = torch.empty(B, Hq, P, device=dev, dtype=torch.float32)
+    has_s2 = ksum is not None
+    assert has_s2 or not prefilter_mean, "prefilter_mean needs ksum"
+    if has_s2:
+        assert ksum.shape == kmin.shape and ksum.stride() == kmin.stride()
+    scores2 = torch.empty_like(scores) if has_s2 else scores
     _block_scores_kernel[(B * Hkv, triton.cdiv(P, 64))](
         q,
         kmin,
         kmax,
         scores,
+        ksum if has_s2 else kmin,
+        scores2,
         seq_len,
         q.stride(0),
         q.stride(1),
@@ -1014,13 +1282,17 @@ def select_blocks_two_stage(
         BLOCK_M=bm,
         BLOCK_P=64,
         D=D,
+        MEAN=has_s2,
     )
     cand = torch.zeros(B, Hkv, P, device=dev, dtype=torch.int32)
+    isc = torch.zeros(B, Hkv, P, device=dev, dtype=torch.int8)
     ncand = torch.empty(B, Hkv, device=dev, dtype=torch.int32)
     nforced = torch.empty_like(ncand)
     _prefilter_kernel[(B * Hkv,)](
         scores,
+        scores2,
         cand,
+        isc,
         ncand,
         nforced,
         seq_len,
@@ -1037,9 +1309,11 @@ def select_blocks_two_stage(
         BLOCK_P=bp,
         ITERS=30,
         SHARED=prefilter_shared,
+        MEAN=prefilter_mean,
         num_warps=8,
     )
     lse = torch.full((B, Hq, P), float("-inf"), device=dev, dtype=torch.float32)
+    pk = torch.zeros_like(lse)
     # Size the grid by the candidate bound, not P: ~4 candidate blocks per program.
     per_head = math.ceil(prefilter_fraction * P)
     max_cand = min(
@@ -1054,6 +1328,7 @@ def select_blocks_two_stage(
         cand,
         ncand,
         lse,
+        pk,
         seq_len,
         q.stride(0),
         q.stride(1),
@@ -1079,6 +1354,7 @@ def select_blocks_two_stage(
     )
     idx = torch.zeros(B, Hkv, cap, device=dev, dtype=torch.int32)
     counts = torch.empty(B, Hkv, device=dev, dtype=torch.int32)
+    kept = torch.zeros(B, Hkv, P, device=dev, dtype=torch.int8)
     _final_select_kernel[(B * Hkv,)](
         lse,
         cand,
@@ -1086,6 +1362,7 @@ def select_blocks_two_stage(
         nforced,
         idx,
         counts,
+        kept,
         lse.stride(0),
         lse.stride(1),
         cand.stride(0),
@@ -1097,10 +1374,23 @@ def select_blocks_two_stage(
         cdf_threshold,
         floor_fraction,
         G=G,
-        BLOCK_P=bp,
+        BLOCK_P=triton.next_power_of_2(max_cand),  # candidate slots, not P
         ITERS=20,
         num_warps=8,
     )
+    if return_aux:
+        aux = dict(
+            s2=scores2,
+            has_s2=has_s2,
+            isc=isc,
+            lse=lse,
+            pk=pk,
+            cand=cand,
+            ncand=ncand,
+            kept=kept,
+            max_cand=max_cand,
+        )
+        return idx, counts, aux
     return idx, counts
 
 
@@ -1120,6 +1410,9 @@ def select_blocks_two_stage_ref(
     local_blocks=8,
     seq_len=None,
     prefilter_shared=True,
+    ksum=None,
+    prefilter_mean=False,
+    return_cand=False,
 ):
     """Readable torch reference of select_blocks_two_stage (same block sets), for tests."""
     B, Hq, D = q.shape
@@ -1137,6 +1430,13 @@ def select_blocks_two_stage_ref(
     ) @ kmin.float().transpose(-1, -2)
     n_keep = math.ceil(int(free.sum()) * prefilter_fraction)
     ranked = bound.masked_fill(~valid, float("-inf"))
+    if prefilter_mean:
+        s2 = _mean_key_scores_ref(q, ksum, block_size, n).masked_fill(
+            ~valid, float("-inf")
+        )
+        ranked = torch.logaddexp(
+            torch.log_softmax(ranked, -1), torch.log_softmax(s2, -1)
+        ) - math.log(2.0)
     if prefilter_shared:
         shared = (
             torch.softmax(ranked, -1).mean(2).masked_fill(~free, -1.0)
@@ -1187,7 +1487,91 @@ def select_blocks_two_stage_ref(
             sel = f_ids + chosen
             idx[bi, h, : len(sel)] = torch.tensor(sel, dtype=torch.int32)
             counts[bi, h] = len(sel)
+    if return_cand:
+        return idx, counts, cand
     return idx, counts
+
+
+def _block_token_counts(P, block_size, n, device):
+    starts = torch.arange(P, device=device) * block_size
+    return (n - starts).clamp(min=1, max=block_size).float()
+
+
+def _mean_key_scores_ref(q, ksum, block_size, n):
+    """q . block-mean key per query head, rounded like the kernel -> [B, Hkv, G, P]."""
+    B, Hq, D = q.shape
+    Hkv, P = ksum.shape[1], ksum.shape[2]
+    cnt = _block_token_counts(P, block_size, n, q.device)
+    kmean = (ksum / cnt[:, None]).to(q.dtype).float()
+    return q.view(B, Hkv, Hq // Hkv, D).float() @ kmean.transpose(-1, -2)
+
+
+def two_stage_tail_ref(
+    q,
+    k,
+    v,
+    k8,
+    kscale,
+    ksum,
+    vsum,
+    block_idx,
+    counts,
+    cand,
+    block_size,
+    rho=0.6,
+    seq_len=None,
+    t1=True,
+    t2=True,
+):
+    """Torch reference of block_sparse_decode_fused(..., tail=...): attention over the
+    selected blocks plus every unselected block as one block-mean pseudo-token."""
+    B, Hq, D = q.shape
+    Hkv, P = ksum.shape[1], ksum.shape[2]
+    G = Hq // Hkv
+    n = int(seq_len) if seq_len is not None else k.shape[2]
+    cur_p = (n + block_size - 1) // block_size
+    pad = cur_p * block_size - n
+    ninf = float("-inf")
+    slot = torch.arange(block_idx.shape[-1], device=q.device)
+    sel = (
+        torch.zeros(B, Hkv, P, dtype=torch.int32, device=q.device).scatter_add_(
+            -1, block_idx.long(), (slot < counts.unsqueeze(-1)).int()
+        )
+        > 0
+    )
+    sel, cand = sel[..., :cur_p], cand[..., :cur_p]
+    qg = q.view(B, Hkv, G, D).float()
+
+    def blocked(x):  # [B, Hkv, G, n] -> [B, Hkv, G, cur_p, bs], -inf padded
+        return torch.nn.functional.pad(x, (0, pad), value=ninf).view(
+            B, Hkv, G, cur_p, block_size
+        )
+
+    lt = blocked(torch.einsum("bhgd,bhnd->bhgn", qg, k[:, :, :n].float()))
+    lt = lt.masked_fill(~sel[:, :, None, :, None], ninf)
+    mx = lt.amax((-1, -2))  # [B, Hkv, G]
+    e = torch.exp(lt - mx[..., None, None])
+    vb = torch.nn.functional.pad(v[:, :, :n].float(), (0, 0, 0, pad)).view(
+        B, Hkv, cur_p, block_size, D
+    )
+    num = torch.einsum("bhgpt,bhptd->bhgd", e, vb)
+    den = e.sum((-1, -2))
+    kd = (k8[:, :, :n].float() * kscale[:, :, :n, None]).to(q.dtype).float()
+    l8 = blocked(torch.einsum("bhgd,bhnd->bhgn", qg, kd))
+    lse = torch.logsumexp(l8, -1)
+    peak = l8.amax(-1) - lse
+    cnt = _block_token_counts(cur_p, block_size, n, q.device)
+    vmean = vsum[:, :, :cur_p] / cnt[:, None]
+    w = torch.zeros_like(lse)
+    if t1:
+        use1 = (cand & ~sel)[:, :, None] & (peak < math.log(rho))
+        w = w + torch.where(use1, torch.exp(lse - mx[..., None]), 0.0)
+    if t2:
+        s2 = _mean_key_scores_ref(q, ksum, block_size, n)[..., :cur_p]
+        use2 = (~cand)[:, :, None].expand_as(s2)
+        w = w + torch.where(use2, torch.exp(s2 + torch.log(cnt) - mx[..., None]), 0.0)
+    out = (num + w @ vmean) / (den + w.sum(-1))[..., None]
+    return out.view(B, Hq, D)
 
 
 @triton.jit

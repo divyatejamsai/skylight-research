@@ -7,6 +7,9 @@ static KV cache, CUDA-graph capture of the whole step) is identical:
   * sparse:       Quest-bound scores + TopCdf/floor budget per KV head, then the kernel;
   * two_stage:    Quest-bound prefilter (top 25% per query head) -> block mass from an
                   int8 key copy on the candidates -> TopCdf/floor, then the kernel.
+                  Suffixes: _u per-query-head union prefilter; _qm prefilter on the average
+                  of the bound and block-mean-key softmaxes; _t add unselected blocks back
+                  as block-mean pseudo-tokens (tail estimate); e.g. two_stage_qm_t.
 
 Prefill is dense (HF forward, B=1) and its cache is copied to every batch slot. Before
 timing it checks the dense loop against HF's own next-token logits, and reports how often
@@ -34,6 +37,7 @@ from sparse_attention_hub.kernels.block_sparse_decode import (
     append_kv,
     block_min_max,
     block_sparse_decode_fused,
+    block_sums,
     quantize_keys,
     select_blocks_fused,
     select_blocks_two_stage,
@@ -85,9 +89,15 @@ class DecodeLoop:
         local_blocks: int,
         layer_fns,
     ):
-        # "two_stage_u": two-stage with the per-query-head union prefilter.
-        self.prefilter_shared = mode != "two_stage_u"
-        mode = "two_stage" if mode == "two_stage_u" else mode
+        # two_stage[_u][_qm][_t]: union prefilter / quest+mean prefilter / tail estimate.
+        flags = set(mode.split("_")[2:]) if mode.startswith("two_stage") else set()
+        assert flags <= {"u", "qm", "t"}, mode
+        self.prefilter_shared = "u" not in flags
+        self.prefilter_mean = "qm" in flags
+        self.tail = "t" in flags
+        self.tail_rho = 0.6
+        self.use_sums = self.prefilter_mean or self.tail
+        mode = "two_stage" if mode.startswith("two_stage") else mode
         self.m, self.mode, self.bs = model, mode, block_size
         self.cdf, self.floor, self.max_frac = cdf, floor, max_frac
         self.sink_blocks, self.local_blocks = sink_blocks, local_blocks
@@ -103,6 +113,7 @@ class DecodeLoop:
         self.P = (self.nmax + block_size - 1) // block_size
         dev, dt = model.device, model.dtype
         self.k, self.v, self.kmin, self.kmax, self.k8, self.ks = [], [], [], [], [], []
+        self.ksum, self.vsum = [], []
         self.prefilter = 0.25
         for layer in prefill_cache.layers:
             # Zeroed: masked positions still enter SDPA's P @ V, and 0 * NaN-garbage = NaN.
@@ -130,6 +141,18 @@ class DecodeLoop:
                 mx[:, :, : pmx.shape[2]] = pmx
                 self.kmin.append(mn)
                 self.kmax.append(mx)
+            if self.use_sums:
+                ksm = torch.zeros(
+                    batch, self.Hkv, self.P, self.D, device=dev, dtype=torch.float32
+                )
+                vsm = torch.zeros_like(ksm)
+                pk, pv = block_sums(kb[:, :, :ctx], block_size), block_sums(
+                    vb[:, :, :ctx], block_size
+                )
+                ksm[:, :, : pk.shape[2]] = pk
+                vsm[:, :, : pv.shape[2]] = pv
+                self.ksum.append(ksm)
+                self.vsum.append(vsm)
         self.tok = torch.zeros(batch, 1, device=dev, dtype=torch.long)
         self.pos = torch.zeros(1, device=dev, dtype=torch.long)
         self.seq_len = torch.zeros(1, device=dev, dtype=torch.int32)
@@ -162,6 +185,9 @@ class DecodeLoop:
             for i in range(len(self.k)):
                 self.kmin[i][:, :, p] = self.k[i][:, :, s : self.ctx].amin(2)
                 self.kmax[i][:, :, p] = self.k[i][:, :, s : self.ctx].amax(2)
+                if self.use_sums:
+                    self.ksum[i][:, :, p] = self.k[i][:, :, s : self.ctx].float().sum(2)
+                    self.vsum[i][:, :, p] = self.v[i][:, :, s : self.ctx].float().sum(2)
 
     def _attend(self, i: int, q: torch.Tensor, attn) -> torch.Tensor:
         """q: [B, Hq, 1, D] after RoPE; KV for this step is already in the cache."""
@@ -198,8 +224,9 @@ class DecodeLoop:
                 self.bs,
                 seq_len=self.seq_len,
             )
+        tail = None
         if self.mode == "two_stage":
-            idx, cnt = select_blocks_two_stage(
+            sel = select_blocks_two_stage(
                 qs,
                 self.kmin[i],
                 self.kmax[i],
@@ -214,7 +241,14 @@ class DecodeLoop:
                 self.local_blocks,
                 seq_len=self.seq_len,
                 prefilter_shared=self.prefilter_shared,
+                ksum=self.ksum[i] if self.use_sums else None,
+                prefilter_mean=self.prefilter_mean,
+                return_aux=self.tail,
             )
+            idx, cnt = sel[:2]
+            if self.tail:
+                assert self.reuse <= 1, "the tail estimate needs this step's selection"
+                tail = dict(aux=sel[2], vsum=self.vsum[i], rho=self.tail_rho)
         else:
             idx, cnt = select_blocks_fused(
                 qs,
@@ -242,7 +276,7 @@ class DecodeLoop:
                 ).squeeze()
             )
         return block_sparse_decode_fused(
-            qs, self.k[i], self.v[i], idx, cnt, self.bs, seq_len=self.seq_len
+            qs, self.k[i], self.v[i], idx, cnt, self.bs, seq_len=self.seq_len, tail=tail
         )
 
     def _with_lookahead(self, idx: torch.Tensor, cnt: torch.Tensor):
@@ -279,6 +313,8 @@ class DecodeLoop:
                     self.kmin[i],
                     self.kmax[i],
                     self.bs,
+                    self.ksum[i] if self.use_sums else None,
+                    self.vsum[i] if self.use_sums else None,
                 )
                 if self.mode == "two_stage":
                     append_k8(k, self.k8[i], self.ks[i], self.pos)
@@ -332,6 +368,7 @@ def main(
     local_tokens: int = 128,
     modes: str = "dense_sdpa,dense_flash,sparse",
     compile: bool = False,
+    tail_rho: float = 0.6,
     out: str = "",
 ) -> None:
     tok = AutoTokenizer.from_pretrained(model)
@@ -382,6 +419,7 @@ def main(
             loop.prefilter = vals[3]
         if len(vals) > 4:
             loop.reuse = int(vals[4])
+        loop.tail_rho = tail_rho
         loop.reset(first)
         loop.step()  # eager step: correctness against HF
         ref_err = (loop.logits[0] - hf_next).abs().max().item()
