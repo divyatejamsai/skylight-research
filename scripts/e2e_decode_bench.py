@@ -20,7 +20,7 @@ import gc
 import json
 import math
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import fire
 import torch
@@ -41,11 +41,15 @@ from sparse_attention_hub.kernels.block_sparse_decode import (
 
 
 def layer_pre(layer, h, cos, sin, B: int, Hq: int, Hkv: int, D: int):
-    """Norm, QKV projections, q/k norms and RoPE of one decoder layer for one token."""
+    """Norm, QKV projections, q/k norms (Qwen3; absent in Qwen2/Llama) and RoPE of one
+    decoder layer for one token."""
     attn = layer.self_attn
     x = layer.input_layernorm(h)
-    q = attn.q_norm(attn.q_proj(x).view(B, 1, Hq, D)).transpose(1, 2)
-    k = attn.k_norm(attn.k_proj(x).view(B, 1, Hkv, D)).transpose(1, 2)
+    q = attn.q_proj(x).view(B, 1, Hq, D)
+    k = attn.k_proj(x).view(B, 1, Hkv, D)
+    if hasattr(attn, "q_norm"):
+        q, k = attn.q_norm(q), attn.k_norm(k)
+    q, k = q.transpose(1, 2), k.transpose(1, 2)
     v = attn.v_proj(x).view(B, 1, Hkv, D).transpose(1, 2)
     return apply_rotary_pos_emb(q, k, cos, sin) + (v,)
 
@@ -81,6 +85,9 @@ class DecodeLoop:
         local_blocks: int,
         layer_fns,
     ):
+        # "two_stage_u": two-stage with the per-query-head union prefilter.
+        self.prefilter_shared = mode != "two_stage_u"
+        mode = "two_stage" if mode == "two_stage_u" else mode
         self.m, self.mode, self.bs = model, mode, block_size
         self.cdf, self.floor, self.max_frac = cdf, floor, max_frac
         self.sink_blocks, self.local_blocks = sink_blocks, local_blocks
@@ -89,7 +96,8 @@ class DecodeLoop:
             batch,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
-            cfg.head_dim,
+            getattr(cfg, "head_dim", None)
+            or cfg.hidden_size // cfg.num_attention_heads,
         )
         self.ctx, self.nmax = ctx, ctx + max_new
         self.P = (self.nmax + block_size - 1) // block_size
@@ -136,8 +144,15 @@ class DecodeLoop:
         self.pre, self.post = layer_fns
         self.track_density = False  # eager-only: record selected/valid token fraction
         self.density = []
+        # Selection reuse: select every `reuse` steps, reuse the block list in between.
+        self.reuse = 1
+        self.select_now = True
+        self.step_i = 0
+        self.sel_idx, self.sel_cnt = {}, {}
+        self.graph_reuse = None
 
     def reset(self, first_token: torch.Tensor) -> None:
+        self.step_i = 0
         self.tok.copy_(first_token.view(-1, 1).expand(self.B, 1))
         self.pos.fill_(self.ctx)
         self.seq_len.fill_(self.ctx + 1)
@@ -173,6 +188,16 @@ class DecodeLoop:
                 self.bs,
                 seq_len=self.seq_len,
             )
+        if not self.select_now and i in self.sel_idx:
+            return block_sparse_decode_fused(
+                qs,
+                self.k[i],
+                self.v[i],
+                self.sel_idx[i],
+                self.sel_cnt[i],
+                self.bs,
+                seq_len=self.seq_len,
+            )
         if self.mode == "two_stage":
             idx, cnt = select_blocks_two_stage(
                 qs,
@@ -188,6 +213,7 @@ class DecodeLoop:
                 self.sink_blocks,
                 self.local_blocks,
                 seq_len=self.seq_len,
+                prefilter_shared=self.prefilter_shared,
             )
         else:
             idx, cnt = select_blocks_fused(
@@ -202,6 +228,13 @@ class DecodeLoop:
                 self.local_blocks,
                 seq_len=self.seq_len,
             )
+        if self.reuse > 1:
+            idx, cnt = self._with_lookahead(idx, cnt)
+            if i in self.sel_idx:
+                self.sel_idx[i].copy_(idx)
+                self.sel_cnt[i].copy_(cnt)
+            else:
+                self.sel_idx[i], self.sel_cnt[i] = idx.clone(), cnt.clone()
         if self.track_density:
             self.density.append(
                 torch.clamp(
@@ -212,8 +245,24 @@ class DecodeLoop:
             qs, self.k[i], self.v[i], idx, cnt, self.bs, seq_len=self.seq_len
         )
 
+    def _with_lookahead(self, idx: torch.Tensor, cnt: torch.Tensor):
+        """Append the next (still empty) block so tokens decoded before the next
+        selection are attended; the kernel masks positions past the current length."""
+        assert (
+            self.reuse <= self.bs
+        ), "a reused selection may span at most one new block"
+        cur_p = (self.seq_len + self.bs - 1) // self.bs
+        nxt = torch.clamp(cur_p, max=self.P - 1).to(torch.int32).view(1, 1, 1)
+        ext = torch.cat([idx, torch.zeros_like(idx[..., :1])], dim=-1)
+        ext.scatter_(-1, cnt.long().unsqueeze(-1), nxt.expand(self.B, self.Hkv, 1))
+        return ext, cnt + (cur_p < self.P).to(torch.int32)
+
     @torch.no_grad()
-    def step(self) -> None:
+    def step(self, select: Optional[bool] = None) -> None:
+        if select is None:
+            select = self.step_i % self.reuse == 0
+        self.select_now = self.reuse <= 1 or select
+        self.step_i += 1
         mm = self.m.model
         B = self.B
         h = mm.embed_tokens(self.tok)
@@ -247,16 +296,25 @@ class DecodeLoop:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(2):
-                self.step()
+                self.step(select=True)
+                if self.reuse > 1:
+                    self.step(select=False)
         torch.cuda.current_stream().wait_stream(s)
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
-            self.step()
+            self.step(select=True)
+        if self.reuse > 1:
+            self.graph_reuse = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph_reuse):
+                self.step(select=False)
 
     def run(self, n: int) -> List[torch.Tensor]:
         toks = []
-        for _ in range(n):
-            self.graph.replay()
+        for t in range(n):
+            if self.reuse <= 1 or t % self.reuse == 0:
+                self.graph.replay()
+            else:
+                self.graph_reuse.replay()
             toks.append(self.tok.clone())
         return toks
 
@@ -302,7 +360,7 @@ def main(
     res: Dict[str, Dict] = {}
     tokens: Dict[str, torch.Tensor] = {}
     for mode in mode_list:
-        name, *knobs = mode.split("@")  # name@cdf@floor@max_frac[@prefilter]
+        name, *knobs = mode.split("@")  # name@cdf@floor@max_frac[@prefilter[@reuse]]
         vals = [float(x) for x in knobs] if knobs else [cdf, floor, max_frac]
         m_cdf, m_floor, m_max = vals[:3]
         loop = DecodeLoop(
@@ -322,6 +380,8 @@ def main(
         )
         if len(vals) > 3:
             loop.prefilter = vals[3]
+        if len(vals) > 4:
+            loop.reuse = int(vals[4])
         loop.reset(first)
         loop.step()  # eager step: correctness against HF
         ref_err = (loop.logits[0] - hf_next).abs().max().item()

@@ -87,7 +87,9 @@ def main(
                 else list(row["answer"])
             )
             for mo in mode_list:
-                name, *knobs = mo.split("@")  # name@cdf@floor@max_frac[@prefilter]
+                name, *knobs = mo.split(
+                    "@"
+                )  # name@cdf@floor@max_frac[@prefilter[@reuse]]
                 vals = [float(x) for x in knobs] if knobs else [0.95, 0.02, 0.1]
                 cdf, floor, max_frac = vals[:3]
                 loop = DecodeLoop(
@@ -105,9 +107,11 @@ def main(
                     math.ceil(local_tokens / block_size),
                     (layer_pre, layer_post),
                 )
-                loop.track_density = name in ("sparse", "two_stage")
+                loop.track_density = name in ("sparse", "two_stage", "two_stage_u")
                 if len(vals) > 3:
                     loop.prefilter = vals[3]
+                if len(vals) > 4:
+                    loop.reuse = int(vals[4])
                 loop.reset(first)
                 out_ids = [int(first)]
                 for _ in range(max_new - 1):

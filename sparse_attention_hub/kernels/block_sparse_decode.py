@@ -172,8 +172,11 @@ def _sparse_decode_kernel(
         s = tl.dot(q, tl.trans(k))
         s = tl.where(tok_ok[None, :], s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(s - m_new[:, None])
+        # A fully masked tile (e.g. a look-ahead block not yet written) keeps m at -inf;
+        # shift by 0 then, since exp(-inf - -inf) would be NaN.
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         v = tl.load(
             v_base + tok[:, None] * stride_vn + offs_d[None, :],

@@ -33,7 +33,12 @@ from sparse_attention_hub.sparse_attention.research_attention.maskers.fixed.impl
     OracleTopKConfig,
     QuestTopKMaskerConfig,
     SinkMaskerConfig,
+    SocketMaskerConfig,
     SpargeTopCdfMaskerConfig,
+)
+from sparse_attention_hub.sparse_attention.research_attention.maskers.sampling.implementations import (
+    AdaptiveSamplingMaskerConfig,
+    MagicPigConfig,
 )
 
 SINK, LOCAL = 128, 128
@@ -278,6 +283,90 @@ def _two_stage_grid() -> List[Tuple[str, Optional[ResearchAttentionConfig]]]:
     return out
 
 
+def _baselines_grid() -> List[Tuple[str, Optional[ResearchAttentionConfig]]]:
+    """Other Skylight methods at comparable density, vAttention sampling stacked on the
+    two-stage selector, and two attribution ablations of the two-stage selector (fixed
+    top-k instead of TopCdf in stage 2; TopCdf without the floor)."""
+    base = [SinkMaskerConfig(sink_size=SINK), LocalMaskerConfig(window_size=LOCAL)]
+
+    def two_stage(**kw):
+        cfg = dict(
+            block_size=64,
+            sim_threshold=-1.0,
+            score="exact",
+            share_kv_groups=True,
+            prefilter_fraction=0.25,
+            key_bits=8,
+        )
+        cfg.update(kw)
+        return SpargeTopCdfMaskerConfig(**cfg)
+
+    def sampling():
+        return AdaptiveSamplingMaskerConfig(
+            base_rate_sampling=0.01,
+            epsilon=0.2,
+            delta=0.2,
+            init_offset=SINK,
+            local_offset=LOCAL,
+        )
+
+    out: List[Tuple[str, Optional[ResearchAttentionConfig]]] = []
+    for h in (0.05, 0.1):
+        out.append(
+            (
+                f"B socket h={h}",
+                ResearchAttentionConfig(
+                    base + [SocketMaskerConfig(heavy_size=h, K=11, L=55, tau=0.5)]
+                ),
+            )
+        )
+    for lsh_l, lsh_k in ((32, 8), (64, 4)):
+        out.append(
+            (
+                f"B magicpig L={lsh_l} K={lsh_k}",
+                ResearchAttentionConfig(
+                    base + [MagicPigConfig(lsh_l=lsh_l, lsh_k=lsh_k)]
+                ),
+            )
+        )
+    for h in (0.02, 0.05):
+        out.append(
+            (
+                f"B vattention-oracle h={h}",
+                ResearchAttentionConfig(
+                    base + [OracleTopKConfig(heavy_size=h), sampling()]
+                ),
+            )
+        )
+    for cdf in (0.9, 0.95):
+        out.append(
+            (
+                f"B vattention+two-stage cdf={cdf}",
+                ResearchAttentionConfig(
+                    base
+                    + [two_stage(cdf_threshold=cdf, topk_fraction=0.02), sampling()]
+                ),
+            )
+        )
+    for frac in (0.15, 0.25, 0.35):
+        out.append(
+            (
+                f"A two-stage fixed-topk frac={frac}",
+                ResearchAttentionConfig(
+                    base + [two_stage(cdf_threshold=1e-6, topk_fraction=frac)]
+                ),
+            )
+        )
+    for cdf in (0.9, 0.95):
+        out.append(
+            (
+                f"A two-stage no-floor cdf={cdf}",
+                ResearchAttentionConfig(base + [two_stage(cdf_threshold=cdf)]),
+            )
+        )
+    return out
+
+
 def _decode_nll(
     adapter: ModelAdapterHF,
     cache,
@@ -322,6 +411,7 @@ def main(
     factorial: bool = False,
     kernel_grid: bool = False,
     two_stage: bool = False,
+    baselines: bool = False,
     var_scales: Tuple[float, ...] = (1.0,),
     device: str = "mps" if torch.backends.mps.is_available() else "cpu",
     dtype: str = "float32",
@@ -349,6 +439,8 @@ def main(
         configs += _kernel_grid()
     if two_stage:
         configs += _two_stage_grid()
+    if baselines:
+        configs += _baselines_grid()
     if filter:
         # fire turns "a,b" into a tuple.
         parts = filter if isinstance(filter, (tuple, list)) else str(filter).split(",")
