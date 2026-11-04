@@ -17,6 +17,7 @@ from .oracle_top_p import OracleTopPMasker, OracleTopPMaskerConfig
 from .pq_top_k import PQCache, PQCacheConfig
 from .quest_top_k import QuestTopKMasker, QuestTopKMaskerConfig
 from .socket_top_k import SocketMasker, SocketMaskerConfig
+from .sparge_top_cdf import SpargeTopCdfMasker, SpargeTopCdfMaskerConfig
 
 __all__ = [
     "LocalMasker",
@@ -27,6 +28,8 @@ __all__ = [
     "OracleTopPMasker",
     "SocketMasker",
     "SocketMaskerConfig",
+    "SpargeTopCdfMasker",
+    "SpargeTopCdfMaskerConfig",
     "PQCache",
     "HashAttentionTopKMasker",
     "DoubleSparsityTopKMasker",
