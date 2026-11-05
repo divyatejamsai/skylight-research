@@ -22,6 +22,30 @@ import torch
 import triton
 import triton.language as tl
 
+# Launch parameters of the fused decode path (defaults from scripts/tune_decode_kernels.py
+# and e2e timings on an H200, Qwen3-4B shapes). decode_blocks_per_split: selected blocks
+# per split-K program; small splits keep many programs busy when the selection is far
+# below its cap (None: size splits from the cap and the SM count). search_radix: probes
+# per round of the TopCdf / prefilter threshold searches (2 = plain bisection);
+# sort_max_blocks: up to this many (padded) blocks a kernel finds its threshold with one
+# exact sort instead.
+TUNE = dict(
+    decode_blocks_per_split=4,
+    decode_warps=4,
+    decode_stages=2,
+    mass_slots=4,
+    mass_warps=4,
+    search_radix=4,
+    sort_max_blocks=1024,
+    prefilter_warps=8,
+    final_warps=4,
+)
+
+
+def _rounds(bisection_steps: int, radix: int) -> int:
+    """Rounds of a radix-way threshold search that resolve as finely as the bisection."""
+    return math.ceil(bisection_steps / math.log2(radix))
+
 
 def block_sums(x: torch.Tensor, block_size: int) -> torch.Tensor:
     """Per-block fp32 sums of x [B, H, N, D] over tokens -> [B, H, ceil(N / bs), D]."""
@@ -316,6 +340,32 @@ def _logaddexp(a, b):
         float("-inf"),
         safe + tl.log(tl.exp(a - safe) + tl.exp(b - safe)),
     )
+
+
+@triton.jit
+def _search_round(lp, w, mask, lo, hi, target, R: tl.constexpr, AT_MOST: tl.constexpr):
+    """One R-ary step of a threshold search on f(t) = sum(w over mask & lp >= t).
+
+    Probes R evenly spaced thresholds in [lo, hi) at once (one 2-D reduction), so a round
+    equals log2(R) bisection steps on the same grid. AT_MOST=False keeps lo at the largest
+    t with f(t) >= target; AT_MOST=True keeps hi at the smallest t with f(t) <= target.
+    """
+    t = lo + (hi - lo) * (tl.arange(0, R).to(tl.float32) / R)
+    f = tl.sum(
+        tl.where(mask[None, :] & (lp[None, :] >= t[:, None]), w[None, :], 0.0), 1
+    )
+    if AT_MOST:
+        ok = f <= target
+        return tl.max(tl.where(ok, lo, t), 0), tl.min(tl.where(ok, t, hi), 0)
+    ok = f >= target
+    return tl.max(tl.where(ok, t, lo), 0), tl.min(tl.where(ok, hi, t), 0)
+
+
+@triton.jit
+def _kth_largest(x, k):
+    """The k-th largest entry (0-based) of a 1-D block, from one bitonic sort."""
+    xs = tl.sort(x, descending=True)
+    return tl.sum(tl.where(tl.arange(0, x.shape[0]) == k, xs, 0.0), axis=0)
 
 
 @triton.jit
@@ -829,12 +879,14 @@ def block_sparse_decode_fused(
     Hkv = k.shape[1]
     G = Hq // Hkv
     kmax_sel = block_idx.shape[-1]
+    bpi = max(1, 64 // block_size)
+    if num_splits is None and TUNE["decode_blocks_per_split"]:
+        num_splits = triton.cdiv(kmax_sel, TUNE["decode_blocks_per_split"])
     if num_splits is None:
         sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         num_splits = max(
             1, min(triton.cdiv(kmax_sel, 4), triton.cdiv(2 * sms, B * Hkv))
         )
-    bpi = max(1, 64 // block_size)
     per_split = triton.cdiv(triton.cdiv(kmax_sel, num_splits), bpi) * bpi
     num_splits = triton.cdiv(kmax_sel, per_split)
     n_tail = 0
@@ -923,8 +975,8 @@ def block_sparse_decode_fused(
         BLOCK_N=block_size,
         D=D,
         BPI=bpi,
-        num_warps=4,
-        num_stages=3,
+        num_warps=TUNE["decode_warps"],
+        num_stages=TUNE["decode_stages"],
     )
     out = torch.empty(B, Hq, D, device=q.device, dtype=q.dtype)
     _merge_kernel[(B * Hq,)](
@@ -984,6 +1036,8 @@ def _prefilter_kernel(
     ITERS: tl.constexpr,
     SHARED: tl.constexpr,
     MEAN: tl.constexpr = False,
+    RADIX: tl.constexpr = 2,
+    SORT: tl.constexpr = False,
 ):
     # SHARED: one top set per KV head from the group-mean bound softmax; otherwise the
     # union of every query head's own top set. MEAN: rank by the average of the bound
@@ -997,6 +1051,7 @@ def _prefilter_kernel(
     forced = valid & ((offs_p < SINK) | (offs_p >= cur_p - LOCAL))
     free = valid & (~forced)
     n_keep = tl.ceil(tl.sum(free.to(tl.float32), axis=0) * pre_frac)
+    ones = tl.full([BLOCK_P], 1.0, tl.float32)
     union = tl.zeros([BLOCK_P], tl.int1)
     lmean = tl.full([BLOCK_P], float("-inf"), tl.float32)
     for g in range(G):
@@ -1022,22 +1077,24 @@ def _prefilter_kernel(
             lmean = _logaddexp(lmean, lpr)
         else:
             # Wide range: a block far down the bound's ranking can still hold real mass.
-            hi = tl.max(tl.where(free, lpr, -1e30), axis=0)
-            lo = hi - 1e4
-            for _ in range(ITERS):
-                mid = (lo + hi) * 0.5
-                ok = tl.sum((free & (lpr >= mid)).to(tl.float32), axis=0) >= n_keep
-                lo = tl.where(ok, mid, lo)
-                hi = tl.where(ok, hi, mid)
+            if SORT:
+                lo = _kth_largest(tl.where(free, lpr, -1e30), n_keep.to(tl.int32) - 1)
+            else:
+                hi = tl.max(tl.where(free, lpr, -1e30), axis=0)
+                lo = hi - 1e4
+                for _ in range(ITERS):
+                    lo, hi = _search_round(
+                        lpr, ones, free, lo, hi, n_keep, RADIX, False
+                    )
             union = union | (free & (lpr >= lo))
     if SHARED:
-        hi = tl.max(tl.where(free, lmean, -1e30), axis=0)
-        lo = hi - 1e4
-        for _ in range(ITERS):
-            mid = (lo + hi) * 0.5
-            ok = tl.sum((free & (lmean >= mid)).to(tl.float32), axis=0) >= n_keep
-            lo = tl.where(ok, mid, lo)
-            hi = tl.where(ok, hi, mid)
+        if SORT:
+            lo = _kth_largest(tl.where(free, lmean, -1e30), n_keep.to(tl.int32) - 1)
+        else:
+            hi = tl.max(tl.where(free, lmean, -1e30), axis=0)
+            lo = hi - 1e4
+            for _ in range(ITERS):
+                lo, hi = _search_round(lmean, ones, free, lo, hi, n_keep, RADIX, False)
         union = free & (lmean >= lo)
     n_forced = tl.sum(forced.to(tl.int32), axis=0)
     slot = tl.where(
@@ -1151,6 +1208,8 @@ def _final_select_kernel(
     G: tl.constexpr,
     BLOCK_P: tl.constexpr,
     ITERS: tl.constexpr,
+    RADIX: tl.constexpr = 2,
+    SORT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     b = (pid // HKV).to(tl.int64)
@@ -1175,40 +1234,58 @@ def _final_select_kernel(
     forced_mass = tl.sum(tl.where(forced, probs, 0.0), axis=0)
     k_floor = tl.ceil(ncand.to(tl.float32) * floor_frac)
     cap_free = (CAP - nf).to(tl.float32)
-    # Thresholds are searched in log-probability: tail blocks of a peaked head sit far
-    # below any fixed absolute resolution, so a search over [0, 1] over-selects them.
-    lp = tl.where(lp_all > -1e30, lp_all, -1e30)
-    # Bracket [best - 60, best]: blocks e^60 below the best free block carry no mass.
-    top = tl.max(tl.where(free, lp, -1e30), axis=0)
-    lo_c = top - 60.0
-    hi_c = top
-    lo_k = top - 60.0
-    hi_k = top
-    lo_x = top - 60.0
-    hi_x = top
-    for _ in range(ITERS):
-        mid_c = (lo_c + hi_c) * 0.5
-        ok_c = (
-            forced_mass + tl.sum(tl.where(free & (lp >= mid_c), probs, 0.0), axis=0)
-            >= tau
-        )
-        lo_c = tl.where(ok_c, mid_c, lo_c)
-        hi_c = tl.where(ok_c, hi_c, mid_c)
-        mid_k = (lo_k + hi_k) * 0.5
-        ok_k = tl.sum((free & (lp >= mid_k)).to(tl.float32), axis=0) >= k_floor
-        lo_k = tl.where(ok_k, mid_k, lo_k)
-        hi_k = tl.where(ok_k, hi_k, mid_k)
-        mid_x = (lo_x + hi_x) * 0.5
-        ok_x = tl.sum((free & (lp >= mid_x)).to(tl.float32), axis=0) <= cap_free
-        hi_x = tl.where(ok_x, mid_x, hi_x)
-        lo_x = tl.where(ok_x, lo_x, mid_x)
-    t = tl.maximum(tl.minimum(lo_c, lo_k), hi_x)
+    if SORT:
+        # Exact TopCdf, as in the reference: sort the free candidates by log-probability,
+        # take n = min(cap, max(floor, the number needed to reach tau)), threshold at the
+        # n-th. Cheaper than the search for small candidate sets; bitonic sort cost grows
+        # as n log^2 n, so large ones use the search.
+        lp = tl.where(free & (lp_all > -1e30), lp_all, -1e30)
+        ls = tl.sort(lp, descending=True)
+        real = ls > -1e30
+        ps = tl.where(real, tl.exp(ls), 0.0)
+        before = tl.cumsum(ps, axis=0) - ps
+        n_cdf = tl.sum((real & (forced_mass + before < tau)).to(tl.float32), axis=0)
+        n_real = tl.sum(real.to(tl.float32), axis=0)
+        n = tl.minimum(tl.minimum(tl.maximum(n_cdf, k_floor), cap_free), n_real)
+        t = tl.sum(tl.where(offs == n.to(tl.int32) - 1, ls, 0.0), axis=0)
+        t = tl.where(n >= 1, t, float("inf"))
+    else:
+        # Thresholds are searched in log-probability: tail blocks of a peaked head sit far
+        # below any fixed absolute resolution, so a search over [0, 1] over-selects them.
+        lp = tl.where(lp_all > -1e30, lp_all, -1e30)
+        # Bracket [best - 60, best]: blocks e^60 below the best free block carry no mass.
+        top = tl.max(tl.where(free, lp, -1e30), axis=0)
+        lo_c = top - 60.0
+        hi_c = top
+        lo_k = top - 60.0
+        hi_k = top
+        lo_x = top - 60.0
+        hi_x = top
+        ones = tl.full([BLOCK_P], 1.0, tl.float32)
+        for _ in range(ITERS):
+            lo_c, hi_c = _search_round(
+                lp, probs, free, lo_c, hi_c, tau - forced_mass, RADIX, False
+            )
+            lo_k, hi_k = _search_round(
+                lp, ones, free, lo_k, hi_k, k_floor, RADIX, False
+            )
+            lo_x, hi_x = _search_round(
+                lp, ones, free, lo_x, hi_x, cap_free, RADIX, True
+            )
+        t = tl.maximum(tl.minimum(lo_c, lo_k), hi_x)
     chosen = free & (lp >= t) & (lp > -1e30)
     keep = forced | chosen
     slot = tl.cumsum(keep.to(tl.int32), axis=0) - 1  # forced occupy the leading slots
     blk = tl.load(CAND + b * stride_cb + h * stride_ch + offs, mask=valid, other=0)
     tl.store(IDX + b * stride_ib + h * stride_ih + slot, blk, mask=keep & (slot < CAP))
-    tl.store(CNT + b * HKV + h, tl.minimum(tl.sum(keep.to(tl.int32), axis=0), CAP))
+    n_sel = tl.minimum(tl.sum(keep.to(tl.int32), axis=0), CAP)
+    tl.store(CNT + b * HKV + h, n_sel)
+    # Zero the unused index slots so callers may scatter over all CAP slots.
+    tl.store(
+        IDX + b * stride_ib + h * stride_ih + offs,
+        tl.zeros([BLOCK_P], tl.int32),
+        mask=(offs >= n_sel) & (offs < CAP),
+    )
     tl.store(
         KEPT + b * stride_cb + h * stride_ch + offs,
         (keep & (slot < CAP)).to(tl.int8),
@@ -1284,8 +1361,10 @@ def select_blocks_two_stage(
         D=D,
         MEAN=has_s2,
     )
-    cand = torch.zeros(B, Hkv, P, device=dev, dtype=torch.int32)
-    isc = torch.zeros(B, Hkv, P, device=dev, dtype=torch.int8)
+    # Every buffer below is written over the range its readers use (candidate slots
+    # < ncand, blocks < cur_p, index slots < CAP), so none needs a fill kernel.
+    cand = torch.empty(B, Hkv, P, device=dev, dtype=torch.int32)
+    isc = torch.empty(B, Hkv, P, device=dev, dtype=torch.int8)
     ncand = torch.empty(B, Hkv, device=dev, dtype=torch.int32)
     nforced = torch.empty_like(ncand)
     _prefilter_kernel[(B * Hkv,)](
@@ -1307,19 +1386,21 @@ def select_blocks_two_stage(
         prefilter_fraction,
         G=G,
         BLOCK_P=bp,
-        ITERS=30,
+        ITERS=_rounds(30, TUNE["search_radix"]),
         SHARED=prefilter_shared,
         MEAN=prefilter_mean,
-        num_warps=8,
+        RADIX=TUNE["search_radix"],
+        SORT=bp <= TUNE["sort_max_blocks"],
+        num_warps=TUNE["prefilter_warps"],
     )
-    lse = torch.full((B, Hq, P), float("-inf"), device=dev, dtype=torch.float32)
-    pk = torch.zeros_like(lse)
+    lse = torch.empty(B, Hq, P, device=dev, dtype=torch.float32)
+    pk = torch.empty_like(lse)
     # Size the grid by the candidate bound, not P: ~4 candidate blocks per program.
     per_head = math.ceil(prefilter_fraction * P)
     max_cand = min(
         P, sink_blocks + local_blocks + (per_head if prefilter_shared else G * per_head)
     )
-    slots = 4
+    slots = TUNE["mass_slots"]
     splits = triton.cdiv(max_cand, slots)
     _block_mass_kernel[(B * Hkv, splits)](
         q,
@@ -1347,14 +1428,15 @@ def select_blocks_two_stage(
         BLOCK_M=bm,
         BLOCK_N=block_size,
         D=D,
-        num_warps=4,
+        num_warps=TUNE["mass_warps"],
     )
     cap = min(
         P, min(P, sink_blocks + local_blocks) + max(1, math.ceil(max_fraction * P))
     )
-    idx = torch.zeros(B, Hkv, cap, device=dev, dtype=torch.int32)
+    idx = torch.empty(B, Hkv, cap, device=dev, dtype=torch.int32)
     counts = torch.empty(B, Hkv, device=dev, dtype=torch.int32)
-    kept = torch.zeros(B, Hkv, P, device=dev, dtype=torch.int8)
+    kept = torch.empty(B, Hkv, P, device=dev, dtype=torch.int8)
+    bp_sel = triton.next_power_of_2(max(max_cand, cap))
     _final_select_kernel[(B * Hkv,)](
         lse,
         cand,
@@ -1374,9 +1456,11 @@ def select_blocks_two_stage(
         cdf_threshold,
         floor_fraction,
         G=G,
-        BLOCK_P=triton.next_power_of_2(max_cand),  # candidate slots, not P
-        ITERS=20,
-        num_warps=8,
+        BLOCK_P=bp_sel,  # candidate slots, not P
+        ITERS=_rounds(20, TUNE["search_radix"]),
+        RADIX=TUNE["search_radix"],
+        SORT=bp_sel <= TUNE["sort_max_blocks"],
+        num_warps=TUNE["final_warps"],
     )
     if return_aux:
         aux = dict(

@@ -32,6 +32,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
+from sparse_attention_hub.kernels.block_sparse_decode import TUNE as KTUNE
 from sparse_attention_hub.kernels.block_sparse_decode import (
     append_k8,
     append_kv,
@@ -355,6 +356,24 @@ class DecodeLoop:
         return toks
 
 
+def _profile_steps(loop: DecodeLoop, n: int = 8) -> None:
+    """GPU time per decode step by kernel, from the torch profiler over graph replays."""
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        loop.run(n)
+        torch.cuda.synchronize()
+    rows = [e for e in prof.key_averages() if e.device_time_total > 0]
+    tot = sum(e.device_time_total for e in rows) / n
+    for e in sorted(rows, key=lambda e: -e.device_time_total)[:25]:
+        t = e.device_time_total / n
+        print(
+            f"  {e.key[:70]:70s} {t / 1000:7.3f} ms {100 * t / tot:5.1f}%"
+            f"  x{e.count // n}"
+        )
+    print(f"  {'kernel time per step':70s} {tot / 1000:7.3f} ms", flush=True)
+
+
 def main(
     model: str = "Qwen/Qwen3-4B-Instruct-2507",
     ctx: int = 65536,
@@ -369,8 +388,15 @@ def main(
     modes: str = "dense_sdpa,dense_flash,sparse",
     compile: bool = False,
     tail_rho: float = 0.6,
+    profile: bool = False,
+    tune: str = "",
     out: str = "",
 ) -> None:
+    # tune: "key=value,..." overrides of kernels.TUNE, e.g. "decode_blocks_per_split=4"
+    for kv in filter(None, str(tune).split(",")):
+        key, val = kv.split("=")
+        assert key in KTUNE, key
+        KTUNE[key] = None if val == "None" else int(val)
     tok = AutoTokenizer.from_pretrained(model)
     m = AutoModelForCausalLM.from_pretrained(
         model, torch_dtype=torch.bfloat16, device_map="cuda", attn_implementation="sdpa"
@@ -439,6 +465,8 @@ def main(
             first_step_top1_matches_hf=same_top1,
         )
         print(mode, json.dumps(res[mode]), flush=True)
+        if profile:
+            _profile_steps(loop)
         del loop
         gc.collect()
         torch.cuda.empty_cache()
