@@ -28,7 +28,8 @@ import triton.language as tl
 # below its cap (None: size splits from the cap and the SM count). search_radix: probes
 # per round of the TopCdf / prefilter threshold searches (2 = plain bisection);
 # sort_max_blocks: up to this many (padded) blocks a kernel finds its threshold with one
-# exact sort instead.
+# exact sort instead. prefilter_warps / final_warps: the most warps those one-program-per-
+# KV-head kernels get; they use one warp per 64 padded blocks (at least 4) up to it.
 TUNE = dict(
     decode_blocks_per_split=4,
     decode_warps=4,
@@ -37,14 +38,20 @@ TUNE = dict(
     mass_warps=4,
     search_radix=4,
     sort_max_blocks=1024,
-    prefilter_warps=8,
-    final_warps=4,
+    prefilter_stats=True,
+    prefilter_warps=16,
+    final_warps=16,
 )
 
 
 def _rounds(bisection_steps: int, radix: int) -> int:
     """Rounds of a radix-way threshold search that resolve as finely as the bisection."""
     return math.ceil(bisection_steps / math.log2(radix))
+
+
+def _warps(most: int, padded_blocks: int) -> int:
+    """One warp per 64 padded blocks, at least 4 and at most `most`."""
+    return max(4, min(most, padded_blocks // 64))
 
 
 def block_sums(x: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -369,13 +376,66 @@ def _kth_largest(x, k):
 
 
 @triton.jit
+def _head_log_softmax(S, S2, off, offs_p, valid, MEAN: tl.constexpr):
+    """One query head's block log-softmax (blended with the mean-key one if MEAN)."""
+    s = tl.load(S + off + offs_p, mask=valid, other=float("-inf"))
+    mx = tl.max(s, axis=0)
+    lpr = s - mx - tl.log(tl.sum(tl.exp(s - mx), axis=0))  # -inf if invalid
+    if MEAN:
+        s2 = tl.load(S2 + off + offs_p, mask=valid, other=float("-inf"))
+        mx2 = tl.max(s2, axis=0)
+        lpr2 = s2 - mx2 - tl.log(tl.sum(tl.exp(s2 - mx2), axis=0))
+        lpr = _logaddexp(lpr, lpr2) - 0.6931471805599453
+    return lpr
+
+
+@triton.jit
+def _top_log(
+    lp, free, ones, n_keep, ITERS: tl.constexpr, RADIX: tl.constexpr, SORT: tl.constexpr
+):
+    """Free blocks at or above the n_keep-th largest log score among free blocks."""
+    if SORT:
+        lo = _kth_largest(tl.where(free, lp, -1e30), n_keep.to(tl.int32) - 1)
+    else:
+        hi = tl.max(tl.where(free, lp, -1e30), axis=0)
+        lo = hi - 1e4
+        for _ in range(ITERS):
+            lo, hi = _search_round(lp, ones, free, lo, hi, n_keep, RADIX, False)
+    return free & (lp >= lo)
+
+
+@triton.jit
+def _top_linear(
+    pr, free, ones, n_keep, ITERS: tl.constexpr, RADIX: tl.constexpr, SORT: tl.constexpr
+):
+    """_top_log on probabilities (zero outside free); needs n_keep nonzero entries."""
+    if SORT:
+        lo = _kth_largest(pr, n_keep.to(tl.int32) - 1)
+        top = free & (pr >= lo) & (pr > 0.0)
+    else:
+        top = _top_log(
+            tl.where(pr > 0.0, tl.log(pr), float("-inf")),
+            free,
+            ones,
+            n_keep,
+            ITERS,
+            RADIX,
+            SORT,
+        )
+    return top
+
+
+@triton.jit
 def _block_scores_kernel(
     Q,
     KMIN,
     KMAX,
     S,
+    E1,
     KSUM,
     S2,
+    E2,
+    ST,
     NPTR,
     stride_qb,
     stride_qh,
@@ -387,12 +447,18 @@ def _block_scores_kernel(
     HKV,
     P,
     BS,
+    NT,
     G: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_P: tl.constexpr,
     D: tl.constexpr,
     MEAN: tl.constexpr = False,
+    STATS: tl.constexpr = False,
 ):
+    # STATS: per query head and tile of BLOCK_P blocks, also store exp(s - tile max) in E1
+    # (exp(s2 - tile max) in E2) plus the tile max and sum in ST [B, Hq, NT, 4], so the
+    # prefilter gets each block's softmax probability with no per-block exp/log of its
+    # own: it runs one program per KV head, this kernel one per tile.
     pid_bh = tl.program_id(0)
     b = (pid_bh // HKV).to(tl.int64)
     h = pid_bh % HKV
@@ -414,11 +480,16 @@ def _block_scores_kernel(
     q_neg = tl.minimum(q, 0.0).to(kmx.dtype)
     s = tl.dot(q_pos, tl.trans(kmx)) + tl.dot(q_neg, tl.trans(kmn))
     s = tl.where(p_ok[None, :], s, float("-inf"))
-    tl.store(
-        S + b * stride_sb + (h * G + offs_m)[:, None] * stride_sh + offs_p[None, :],
-        s,
-        mask=row_ok[:, None] & (offs_p[None, :] < P),
-    )
+    st = ST + ((b * HKV * G + h * G + offs_m) * NT + tl.program_id(1)) * 4
+    out = b * stride_sb + (h * G + offs_m)[:, None] * stride_sh + offs_p[None, :]
+    out_ok = row_ok[:, None] & (offs_p[None, :] < P)
+    tl.store(S + out, s, mask=out_ok)
+    if STATS:
+        m1 = tl.max(s, axis=1)
+        e1 = tl.exp(s - tl.where(m1 == float("-inf"), 0.0, m1)[:, None])
+        tl.store(st, m1, mask=row_ok)
+        tl.store(st + 1, tl.sum(e1, axis=1), mask=row_ok)
+        tl.store(E1 + out, e1, mask=out_ok)
     if MEAN:
         # q . block-mean key (SpargeAttn's block score); the last block may be partial.
         n_tok = tl.minimum(BS, tl.load(NPTR) - offs_p * BS).to(tl.float32)
@@ -434,6 +505,19 @@ def _block_scores_kernel(
             s2,
             mask=row_ok[:, None] & (offs_p[None, :] < P),
         )
+        if STATS:
+            m2 = tl.max(s2, axis=1)
+            e2 = tl.exp(s2 - tl.where(m2 == float("-inf"), 0.0, m2)[:, None])
+            tl.store(st + 2, m2, mask=row_ok)
+            tl.store(st + 3, tl.sum(e2, axis=1), mask=row_ok)
+            tl.store(
+                E2
+                + b * stride_sb
+                + (h * G + offs_m)[:, None] * stride_sh
+                + offs_p[None, :],
+                e2,
+                mask=row_ok[:, None] & (offs_p[None, :] < P),
+            )
 
 
 @triton.jit
@@ -554,7 +638,10 @@ def select_blocks_fused(
         kmin,
         kmax,
         scores,
+        scores,
         kmin,
+        scores,
+        scores,
         scores,
         seq_len,
         q.stride(0),
@@ -567,6 +654,7 @@ def select_blocks_fused(
         Hkv,
         P,
         block_size,
+        triton.cdiv(P, bp),
         G=G,
         BLOCK_M=max(16, triton.next_power_of_2(G)),
         BLOCK_P=bp,
@@ -1016,7 +1104,10 @@ def quantize_keys(k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 @triton.jit
 def _prefilter_kernel(
     S,
+    E1,
     S2,
+    E2,
+    ST,
     CAND,
     ISC,
     NCAND,
@@ -1031,6 +1122,7 @@ def _prefilter_kernel(
     SINK,
     LOCAL,
     pre_frac,
+    NT,
     G: tl.constexpr,
     BLOCK_P: tl.constexpr,
     ITERS: tl.constexpr,
@@ -1038,6 +1130,9 @@ def _prefilter_kernel(
     MEAN: tl.constexpr = False,
     RADIX: tl.constexpr = 2,
     SORT: tl.constexpr = False,
+    STATS: tl.constexpr = False,
+    TILE: tl.constexpr = 64,
+    BLOCK_T: tl.constexpr = 16,
 ):
     # SHARED: one top set per KV head from the group-mean bound softmax; otherwise the
     # union of every query head's own top set. MEAN: rank by the average of the bound
@@ -1053,49 +1148,58 @@ def _prefilter_kernel(
     n_keep = tl.ceil(tl.sum(free.to(tl.float32), axis=0) * pre_frac)
     ones = tl.full([BLOCK_P], 1.0, tl.float32)
     union = tl.zeros([BLOCK_P], tl.int1)
-    lmean = tl.full([BLOCK_P], float("-inf"), tl.float32)
-    for g in range(G):
-        s = tl.load(
-            S + b * stride_sb + (h * G + g) * stride_sh + offs_p,
-            mask=valid,
-            other=float("-inf"),
-        )
-        mx = tl.max(s, axis=0)
-        lpr = (
-            s - mx - tl.log(tl.sum(tl.exp(s - mx), axis=0))
-        )  # log-softmax, -inf if invalid
-        if MEAN:
-            s2 = tl.load(
-                S2 + b * stride_sb + (h * G + g) * stride_sh + offs_p,
-                mask=valid,
-                other=float("-inf"),
-            )
-            mx2 = tl.max(s2, axis=0)
-            lpr2 = s2 - mx2 - tl.log(tl.sum(tl.exp(s2 - mx2), axis=0))
-            lpr = _logaddexp(lpr, lpr2) - 0.6931471805599453
-        if SHARED:
-            lmean = _logaddexp(lmean, lpr)
+    if STATS:
+        # SHARED only (the launch gates it; a per-head union gains nothing, measured).
+        # Ranking from the scores kernel's tile statistics: each block's softmax
+        # probability is exp(s - tile max) * exp(tile max - max) / sum, summed in linear
+        # space over the group like the reference (softmax(...).mean over heads). Below
+        # ~1e-30 fp32 loses precision and then underflows (one block > ~87 logits above
+        # the rest), so if fewer than n_keep blocks clear it the ranking is redone in log
+        # space.
+        offs_t = tl.arange(0, BLOCK_T)
+        t_ok = offs_t < NT
+        tile_e = offs_p // TILE
+        pm = tl.zeros([BLOCK_P], tl.float32)
+        for g in range(G):
+            off = b * stride_sb + (h * G + g) * stride_sh
+            st = ST + ((b * HKV * G + h * G + g) * NT) * 4
+            mt = tl.load(st + offs_t * 4, mask=t_ok, other=float("-inf"))
+            zt = tl.load(st + offs_t * 4 + 1, mask=t_ok, other=0.0)
+            mx = tl.max(mt, axis=0)
+            z = tl.sum(tl.where(zt > 0, zt * tl.exp(mt - mx), 0.0), axis=0)
+            me = tl.load(st + tile_e * 4, mask=valid, other=float("-inf"))
+            pr = tl.load(E1 + off + offs_p, mask=valid, other=0.0) * tl.exp(me - mx) / z
+            if MEAN:
+                mt = tl.load(st + offs_t * 4 + 2, mask=t_ok, other=float("-inf"))
+                zt = tl.load(st + offs_t * 4 + 3, mask=t_ok, other=0.0)
+                mx = tl.max(mt, axis=0)
+                z = tl.sum(tl.where(zt > 0, zt * tl.exp(mt - mx), 0.0), axis=0)
+                me = tl.load(st + tile_e * 4 + 2, mask=valid, other=float("-inf"))
+                pr2 = tl.load(E2 + off + offs_p, mask=valid, other=0.0)
+                pr = 0.5 * (pr + pr2 * tl.exp(me - mx) / z)
+            pm += pr
+        pm = tl.where(free, pm, 0.0)
+        if tl.sum((pm > 1e-30).to(tl.float32), axis=0) >= n_keep:
+            union = _top_linear(pm, free, ones, n_keep, ITERS, RADIX, SORT)
         else:
-            # Wide range: a block far down the bound's ranking can still hold real mass.
-            if SORT:
-                lo = _kth_largest(tl.where(free, lpr, -1e30), n_keep.to(tl.int32) - 1)
+            lmean = tl.full([BLOCK_P], float("-inf"), tl.float32)
+            for g in range(G):
+                off = b * stride_sb + (h * G + g) * stride_sh
+                lpr = _head_log_softmax(S, S2, off, offs_p, valid, MEAN)
+                lmean = _logaddexp(lmean, lpr)
+            union = _top_log(lmean, free, ones, n_keep, ITERS, RADIX, SORT)
+    else:
+        lmean = tl.full([BLOCK_P], float("-inf"), tl.float32)
+        for g in range(G):
+            off = b * stride_sb + (h * G + g) * stride_sh
+            lpr = _head_log_softmax(S, S2, off, offs_p, valid, MEAN)
+            if SHARED:
+                lmean = _logaddexp(lmean, lpr)
             else:
-                hi = tl.max(tl.where(free, lpr, -1e30), axis=0)
-                lo = hi - 1e4
-                for _ in range(ITERS):
-                    lo, hi = _search_round(
-                        lpr, ones, free, lo, hi, n_keep, RADIX, False
-                    )
-            union = union | (free & (lpr >= lo))
-    if SHARED:
-        if SORT:
-            lo = _kth_largest(tl.where(free, lmean, -1e30), n_keep.to(tl.int32) - 1)
-        else:
-            hi = tl.max(tl.where(free, lmean, -1e30), axis=0)
-            lo = hi - 1e4
-            for _ in range(ITERS):
-                lo, hi = _search_round(lmean, ones, free, lo, hi, n_keep, RADIX, False)
-        union = free & (lmean >= lo)
+                # Wide range: a block far down the bound's ranking can still hold real mass.
+                union = union | _top_log(lpr, free, ones, n_keep, ITERS, RADIX, SORT)
+        if SHARED:
+            union = _top_log(lmean, free, ones, n_keep, ITERS, RADIX, SORT)
     n_forced = tl.sum(forced.to(tl.int32), axis=0)
     slot = tl.where(
         forced,
@@ -1337,13 +1441,24 @@ def select_blocks_two_stage(
     if has_s2:
         assert ksum.shape == kmin.shape and ksum.stride() == kmin.stride()
     scores2 = torch.empty_like(scores) if has_s2 else scores
-    _block_scores_kernel[(B * Hkv, triton.cdiv(P, 64))](
+    nt = triton.cdiv(P, 64)
+    stats = prefilter_shared and bool(TUNE["prefilter_stats"])
+    if stats:
+        e1 = torch.empty_like(scores)
+        e2 = torch.empty_like(scores) if has_s2 else scores
+        tile_stats = torch.empty(B, Hq, nt, 4, device=dev, dtype=torch.float32)
+    else:
+        e1 = e2 = tile_stats = scores
+    _block_scores_kernel[(B * Hkv, nt)](
         q,
         kmin,
         kmax,
         scores,
+        e1,
         ksum if has_s2 else kmin,
         scores2,
+        e2,
+        tile_stats,
         seq_len,
         q.stride(0),
         q.stride(1),
@@ -1355,11 +1470,13 @@ def select_blocks_two_stage(
         Hkv,
         P,
         block_size,
+        nt,
         G=G,
         BLOCK_M=bm,
         BLOCK_P=64,
         D=D,
         MEAN=has_s2,
+        STATS=stats,
     )
     # Every buffer below is written over the range its readers use (candidate slots
     # < ncand, blocks < cur_p, index slots < CAP), so none needs a fill kernel.
@@ -1369,7 +1486,10 @@ def select_blocks_two_stage(
     nforced = torch.empty_like(ncand)
     _prefilter_kernel[(B * Hkv,)](
         scores,
+        e1,
         scores2,
+        e2,
+        tile_stats,
         cand,
         isc,
         ncand,
@@ -1384,6 +1504,7 @@ def select_blocks_two_stage(
         sink_blocks,
         local_blocks,
         prefilter_fraction,
+        nt,
         G=G,
         BLOCK_P=bp,
         ITERS=_rounds(30, TUNE["search_radix"]),
@@ -1391,7 +1512,9 @@ def select_blocks_two_stage(
         MEAN=prefilter_mean,
         RADIX=TUNE["search_radix"],
         SORT=bp <= TUNE["sort_max_blocks"],
-        num_warps=TUNE["prefilter_warps"],
+        STATS=stats,
+        BLOCK_T=triton.next_power_of_2(nt),
+        num_warps=_warps(TUNE["prefilter_warps"], bp),
     )
     lse = torch.empty(B, Hq, P, device=dev, dtype=torch.float32)
     pk = torch.empty_like(lse)
@@ -1460,7 +1583,7 @@ def select_blocks_two_stage(
         ITERS=_rounds(20, TUNE["search_radix"]),
         RADIX=TUNE["search_radix"],
         SORT=bp_sel <= TUNE["sort_max_blocks"],
-        num_warps=TUNE["final_warps"],
+        num_warps=_warps(TUNE["final_warps"], bp_sel),
     )
     if return_aux:
         aux = dict(

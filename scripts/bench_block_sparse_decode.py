@@ -175,8 +175,14 @@ def check_fused(block_size: int = 64, n: int = 32768 + 37, seed: int = 0) -> Non
     )
 
 
-def check_two_stage(block_size: int = 64, n: int = 32768 + 37, seed: int = 0) -> None:
-    """Two-stage kernels vs the torch reference: block sets, captured mass, attention, int8 append."""
+def check_two_stage(
+    block_size: int = 64, n: int = 32768 + 37, seed: int = 0, sink: float = 0.0
+) -> None:
+    """Two-stage kernels vs the torch reference: block sets, captured mass, attention, int8 append.
+
+    sink > 0 adds sink * (sum of the group's queries) to the first block's keys, so its
+    bound logit beats every other block's by ~4 * sink and their fp32 softmax underflows.
+    """
     torch.manual_seed(seed)
     dev = "cuda"
     B = 2
@@ -191,6 +197,7 @@ def check_two_stage(block_size: int = 64, n: int = 32768 + 37, seed: int = 0) ->
         k[:, :, pos : pos + 40] += (
             2.5 * math.sqrt(D) * q.view(B, HKV, HQ // HKV, D)[:, :, j % 4 : j % 4 + 1]
         )
+    k[:, :, :block_size] += sink * q.view(B, HKV, HQ // HKV, D).sum(2, keepdim=True)
     kmin, kmax = block_min_max(k, block_size)
     k8, ks = quantize_keys(k)
     seq = torch.full((1,), n, device=dev, dtype=torch.int32)
