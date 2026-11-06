@@ -72,6 +72,8 @@ class EfficientAttention(SparseAttention):
             DoubleSparsityConfig,
             HashAttention,
             HashAttentionConfig,
+            TwoStageBlockSparse,
+            TwoStageBlockSparseConfig,
         )
 
         # Registry mapping config types to concrete efficient attention classes
@@ -80,6 +82,7 @@ class EfficientAttention(SparseAttention):
         ] = {
             DoubleSparsityConfig: DoubleSparsity,
             HashAttentionConfig: HashAttention,
+            TwoStageBlockSparseConfig: TwoStageBlockSparse,
         }
 
         # Look up the concrete class based on the config type

@@ -11,6 +11,7 @@ from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..sparse_attention.base import SparseAttention, SparseAttentionConfig
+from ..sparse_attention.efficient_attention.base import EfficientAttention
 from ..sparse_attention.research_attention.base import ResearchAttention
 from .base import ModelAdapter, Request, RequestResponse
 from .model_servers.huggingface import ModelServerHF
@@ -339,7 +340,9 @@ class ModelAdapterHF(ModelAdapter):
             ALL_ATTENTION_FUNCTIONS.register(
                 self._registered_attention_name, self._custom_attention_fn
             )
-            if isinstance(self.sparse_attention, ResearchAttention):
+            if isinstance(
+                self.sparse_attention, (ResearchAttention, EfficientAttention)
+            ):
                 ALL_MASK_ATTENTION_FUNCTIONS.register(
                     self._registered_attention_name, eager_mask
                 )
