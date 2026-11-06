@@ -2,6 +2,10 @@
 
   check_tail: quest+mean prefilter block sets and the tail-estimate attention vs torch
          references, and the running block K/V sums of append_kv.
+  check_live_prefilter: the live-length prefilter vs the padded one, with the cache
+         capacity above the live length, from no free blocks up to a full cache; and
+         its candidate count when many scores tie exactly.
+  check_region_prefilter: the per-region prefilter's candidates vs the torch reference.
   check: kernel output vs masked dense attention (fp32 reference) for the same selection,
          and the all-blocks kernel vs torch SDPA.
   bench: per-layer decode attention latency (one token, Qwen3-4B shapes: 32 q / 8 kv heads,
@@ -12,6 +16,7 @@ Example:
     python scripts/bench_block_sparse_decode.py --ctx "[32768,65536,131072]" --batch "[1,8]"
 """
 
+import functools
 import json
 import math
 from typing import Dict, List
@@ -22,6 +27,8 @@ import torch.nn.functional as F
 from triton.testing import do_bench
 
 from sparse_attention_hub.kernels.block_sparse_decode import (
+    TUNE,
+    _keep_count,
     append_k8,
     append_kv,
     block_min_max,
@@ -95,6 +102,31 @@ def _graphed(fn):
     with torch.cuda.graph(g):
         fn()
     return g.replay
+
+
+def _ref_region(shared: bool) -> dict:
+    """The kernel's prefilter regions, for the reference (only the shared live path uses
+    them)."""
+    live = shared and TUNE["prefilter_stats"] and TUNE["prefilter_chunk"] > 0
+    return dict(
+        region=TUNE["prefilter_region"] if live else 0,
+        region_alpha=TUNE["prefilter_region_alpha"],
+    )
+
+
+def _global_prefilter(fn):
+    """Run a check with the global top-k prefilter (TUNE prefilter_region = 0)."""
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        old = TUNE["prefilter_region"]
+        TUNE["prefilter_region"] = 0
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            TUNE["prefilter_region"] = old
+
+    return run
 
 
 def _as_sets(idx, cnt):
@@ -223,6 +255,7 @@ def check_two_stage(
             2,
             seq_len=seq,
             prefilter_shared=sh,
+            **_ref_region(sh),
         )
         fi, fc = select_blocks_two_stage(
             q,
@@ -312,6 +345,7 @@ def check_tail(block_size: int = 64, n: int = 32768 + 37, seed: int = 0) -> None
             ksum=ksum,
             prefilter_mean=True,
             return_cand=True,
+            **_ref_region(sh),
         )
         fi, fc, aux = select_blocks_two_stage(
             *args,
@@ -382,6 +416,153 @@ def check_tail(block_size: int = 64, n: int = 32768 + 37, seed: int = 0) -> None
     )
 
 
+@_global_prefilter
+def check_live_prefilter(
+    block_size: int = 64, cap: int = 131072 + 128, seed: int = 0
+) -> None:
+    """Candidate lists of the live-length prefilter vs the padded one (TUNE prefilter_chunk).
+
+    The cache holds cap tokens; the live length runs from a few blocks (no free blocks)
+    to cap, at 32/8 and 12/2 heads, ranking by the bound alone and by quest+mean. Then
+    7/8 of the keys are zeroed so their blocks tie exactly at the threshold, and the live
+    prefilter's free candidate count is checked against n_keep.
+    """
+    torch.manual_seed(seed)
+    dev, B = "cuda", 2
+    chunk = TUNE["prefilter_chunk"] or 1024
+    for hq, hkv in ((HQ, HKV), (12, 2)):
+        q = torch.randn(B, hq, D, device=dev, dtype=torch.bfloat16) * (
+            2.0 / math.sqrt(D)
+        )
+        k = torch.randn(B, hkv, cap, D, device=dev, dtype=torch.bfloat16)
+        kmin, kmax = block_min_max(k, block_size)
+        ksum = block_sums(k, block_size)
+        k8, ks = quantize_keys(k)
+        for n in (200, 300, 9000, cap // 2 + 37, cap - 100, cap):
+            seq = torch.full((1,), n, device=dev, dtype=torch.int32)
+            for mean in (False, True):
+                lists = []
+                for c in (0, chunk):
+                    old = TUNE["prefilter_chunk"]
+                    TUNE["prefilter_chunk"] = c
+                    _, _, aux = select_blocks_two_stage(
+                        q,
+                        kmin,
+                        kmax,
+                        k8,
+                        ks,
+                        block_size,
+                        0.95,
+                        0.02,
+                        0.15,
+                        0.25,
+                        2,
+                        2,
+                        seq_len=seq,
+                        ksum=ksum,
+                        prefilter_mean=mean,
+                        return_aux=True,
+                    )
+                    TUNE["prefilter_chunk"] = old
+                    nc, cand = aux["ncand"].cpu(), aux["cand"].cpu()
+                    lists.append(
+                        [
+                            cand[b, h, : nc[b, h]].tolist()
+                            for b in range(B)
+                            for h in range(hkv)
+                        ]
+                    )
+                pad, live = lists
+                print(
+                    f"heads {hq}/{hkv} cap {cap} live {n} mean={mean}: "
+                    f"candidates {sum(map(len, live))} sym-diff="
+                    f"{sum(len(set(a) ^ set(b)) for a, b in zip(pad, live))} "
+                    f"same order={pad == live}"
+                )
+        # Exact ties at the threshold: zero keys give every block in the first 7/8 the
+        # same score, below the ~256 random blocks after them; the live prefilter still
+        # keeps exactly n_keep free blocks.
+        k[:, :, : cap * 7 // 8] = 0
+        kmin, kmax = block_min_max(k, block_size)
+        ksum = block_sums(k, block_size)
+        k8, ks = quantize_keys(k)
+        seq = torch.full((1,), cap, device=dev, dtype=torch.int32)
+        _, _, aux = select_blocks_two_stage(
+            q,
+            kmin,
+            kmax,
+            k8,
+            ks,
+            block_size,
+            0.95,
+            0.02,
+            0.15,
+            0.25,
+            2,
+            2,
+            seq_len=seq,
+            ksum=ksum,
+            prefilter_mean=True,
+            return_aux=True,
+        )
+        cur_p = math.ceil(cap / block_size)
+        free = (aux["ncand"] - min(cur_p, 4)).flatten().tolist()
+        print(
+            f"heads {hq}/{hkv} ties: free candidates {sorted(set(free))}, "
+            f"n_keep {_keep_count(cur_p - min(cur_p, 4), 0.25)}"
+        )
+
+
+def check_region_prefilter(
+    block_size: int = 64, cap: int = 131072 + 128, region: int = 512, seed: int = 0
+) -> None:
+    """Per-region prefilter candidates (TUNE prefilter_region) vs the torch reference.
+
+    A cache of cap tokens with attended spans concentrated in a few regions; live lengths
+    from one region to the full cache, 32/8 and 12/2 heads, bound-only and quest+mean.
+    """
+    torch.manual_seed(seed)
+    dev, B = "cuda", 2
+    old = TUNE["prefilter_region"]
+    TUNE["prefilter_region"] = region
+    for hq, hkv in ((HQ, HKV), (12, 2)):
+        G = hq // hkv
+        q = torch.randn(B, hq, D, device=dev, dtype=torch.bfloat16) * (
+            2.0 / math.sqrt(D)
+        )
+        k = torch.randn(B, hkv, cap, D, device=dev, dtype=torch.bfloat16)
+        for j, pos in enumerate((3000, 9000, 20000, 70000, 70500, 71000)):
+            k[:, :, pos : pos + 40] += (
+                2.5 * math.sqrt(D) * q.view(B, hkv, G, D)[:, :, j % G : j % G + 1]
+            )
+        kmin, kmax = block_min_max(k, block_size)
+        ksum = block_sums(k, block_size)
+        k8, ks = quantize_keys(k)
+        for n in (region * block_size - 100, 40000, 90000, cap):
+            seq = torch.full((1,), n, device=dev, dtype=torch.int32)
+            for mean in (False, True):
+                args = (q, kmin, kmax, k8, ks, block_size, 0.95, 0.02, 0.15, 0.25, 2, 2)
+                kw = dict(seq_len=seq, ksum=ksum, prefilter_mean=mean)
+                _, _, rcand = select_blocks_two_stage_ref(
+                    *args, return_cand=True, **kw, **_ref_region(True)
+                )
+                _, _, aux = select_blocks_two_stage(*args, return_aux=True, **kw)
+                nc, cand = aux["ncand"].cpu(), aux["cand"].cpu()
+                diff = sum(
+                    len(
+                        set(cand[b, h, : nc[b, h]].tolist())
+                        ^ set(torch.nonzero(rcand[b, h]).flatten().tolist())
+                    )
+                    for b in range(B)
+                    for h in range(hkv)
+                )
+                print(
+                    f"heads {hq}/{hkv} region {region} live {n} mean={mean}: "
+                    f"candidates {int(nc.sum())} ref {int(rcand.sum())} sym-diff={diff}"
+                )
+    TUNE["prefilter_region"] = old
+
+
 def bench(
     ctx: List[int] = (32768, 65536, 131072),
     batch: List[int] = (1, 8),
@@ -441,6 +622,8 @@ if __name__ == "__main__":
             "check_fused": check_fused,
             "check_two_stage": check_two_stage,
             "check_tail": check_tail,
+            "check_live_prefilter": check_live_prefilter,
+            "check_region_prefilter": check_region_prefilter,
             "bench": bench,
         }
     )

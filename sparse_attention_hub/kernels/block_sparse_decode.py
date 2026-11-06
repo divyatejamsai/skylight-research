@@ -30,17 +30,33 @@ import triton.language as tl
 # sort_max_blocks: up to this many (padded) blocks a kernel finds its threshold with one
 # exact sort instead. prefilter_warps / final_warps: the most warps those one-program-per-
 # KV-head kernels get; they use one warp per 64 padded blocks (at least 4) up to it.
+# prefilter_chunk: with tile stats, the shared prefilter walks the live blocks in pieces
+# this wide (0: one tile padded to the capacity, as before); prefilter_chunk_warps: its
+# warps; prefilter_digit: bits per radix-select round; prefilter_region: if > 0, each
+# run of this many blocks keeps its own share of the candidates, one program per run,
+# instead of the global top (0); prefilter_region_alpha: weight of a region's block count
+# in its share, the rest following its share of the ranking probability. final_split: the final selection
+# keeps forced candidates apart and sorts only the free ones (False: one padded tile).
+# mass_slots / mass_warps / mass_stages: candidate blocks per block-mass program, its
+# warps, and its software-pipelining depth.
 TUNE = dict(
     decode_blocks_per_split=4,
     decode_warps=4,
     decode_stages=2,
-    mass_slots=4,
-    mass_warps=4,
+    mass_slots=2,
+    mass_warps=2,
+    mass_stages=2,
     search_radix=4,
     sort_max_blocks=1024,
     prefilter_stats=True,
     prefilter_warps=16,
     final_warps=16,
+    prefilter_chunk=512,
+    prefilter_chunk_warps=8,
+    prefilter_digit=4,
+    prefilter_region=512,
+    prefilter_region_alpha=0.5,
+    final_split=True,
 )
 
 
@@ -454,11 +470,13 @@ def _block_scores_kernel(
     D: tl.constexpr,
     MEAN: tl.constexpr = False,
     STATS: tl.constexpr = False,
+    STORE_E: tl.constexpr = True,
 ):
     # STATS: per query head and tile of BLOCK_P blocks, also store exp(s - tile max) in E1
     # (exp(s2 - tile max) in E2) plus the tile max and sum in ST [B, Hq, NT, 4], so the
     # prefilter gets each block's softmax probability with no per-block exp/log of its
-    # own: it runs one program per KV head, this kernel one per tile.
+    # own: it runs one program per KV head, this kernel one per tile. STORE_E=False keeps
+    # only the tile max and sum (the live-length prefilter needs just the normalizers).
     pid_bh = tl.program_id(0)
     b = (pid_bh // HKV).to(tl.int64)
     h = pid_bh % HKV
@@ -489,7 +507,8 @@ def _block_scores_kernel(
         e1 = tl.exp(s - tl.where(m1 == float("-inf"), 0.0, m1)[:, None])
         tl.store(st, m1, mask=row_ok)
         tl.store(st + 1, tl.sum(e1, axis=1), mask=row_ok)
-        tl.store(E1 + out, e1, mask=out_ok)
+        if STORE_E:
+            tl.store(E1 + out, e1, mask=out_ok)
     if MEAN:
         # q . block-mean key (SpargeAttn's block score); the last block may be partial.
         n_tok = tl.minimum(BS, tl.load(NPTR) - offs_p * BS).to(tl.float32)
@@ -510,14 +529,15 @@ def _block_scores_kernel(
             e2 = tl.exp(s2 - tl.where(m2 == float("-inf"), 0.0, m2)[:, None])
             tl.store(st + 2, m2, mask=row_ok)
             tl.store(st + 3, tl.sum(e2, axis=1), mask=row_ok)
-            tl.store(
-                E2
-                + b * stride_sb
-                + (h * G + offs_m)[:, None] * stride_sh
-                + offs_p[None, :],
-                e2,
-                mask=row_ok[:, None] & (offs_p[None, :] < P),
-            )
+            if STORE_E:
+                tl.store(
+                    E2
+                    + b * stride_sb
+                    + (h * G + offs_m)[:, None] * stride_sh
+                    + offs_p[None, :],
+                    e2,
+                    mask=row_ok[:, None] & (offs_p[None, :] < P),
+                )
 
 
 @triton.jit
@@ -1221,6 +1241,231 @@ def _prefilter_kernel(
 
 
 @triton.jit
+def _ordered_key(x):
+    """int32 keys that compare (signed) in the same order as the fp32 values x."""
+    bits = x.to(tl.int32, bitcast=True)
+    return tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+
+
+@triton.jit
+def _prefilter_live_kernel(
+    S,
+    S2,
+    ST,
+    KEY,
+    CAND,
+    ISC,
+    NCAND,
+    NFORCED,
+    NPTR,
+    stride_sb,
+    stride_sh,
+    stride_cb,
+    stride_ch,
+    HKV,
+    BS,
+    SINK,
+    LOCAL,
+    pre_frac,
+    NT,
+    alpha,
+    G: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    MEAN: tl.constexpr = False,
+    DIGIT: tl.constexpr = 8,
+    REGION: tl.constexpr = 0,
+    BLOCK_R: tl.constexpr = 1,
+    BLOCK_F: tl.constexpr = 1,
+):
+    # The shared prefilter with work proportional to the live length: block scores are
+    # walked in CHUNK-wide pieces up to cur_p (read on device, so CUDA graphs still see a
+    # fixed launch) instead of one tile padded to the capacity. Each query head's
+    # log-softmax normalizer comes from the scores kernel's tile statistics, so a chunk's
+    # ranking key, the log of the group's summed block probability, needs no whole-row
+    # pass. The n_keep-th largest key is found exactly by a radix select over DIGIT-bit
+    # digits: one 2**DIGIT-bin histogram per digit, restricted to keys matching the
+    # digits above. tl.histogram's cost grows with the bin count, so 4-bit digits (eight
+    # rounds) beat 8-bit ones (four) and 11-bit ones are slower still. Exactly n_keep
+    # blocks are kept: keys tied at the threshold are taken in block order.
+    # REGION > 0 (grid axis 1, a multiple of the scores kernel's 64-block tiles): each
+    # program keeps the top of its own REGION blocks instead of the global top, so a KV
+    # head's selection runs as several programs. Region r's quota mixes its share of the
+    # free blocks with its share of the ranking probability (weight alpha on the first),
+    # the latter read from the tile statistics minus the forced blocks; a region holding
+    # most of the mass so gets most of the candidates. Every program derives all quotas
+    # the same way, so slot offsets agree without communication. Quotas are cumulative
+    # roundings of n_keep (capped at a region's free blocks), so they never exceed it.
+    pid = tl.program_id(0)
+    b = (pid // HKV).to(tl.int64)
+    h = pid % HKV
+    cur_p = (tl.load(NPTR) + BS - 1) // BS
+    n_forced = tl.minimum(cur_p, SINK + LOCAL)  # sink and local blocks overlap below
+    n_keep = tl.ceil((cur_p - n_forced).to(tl.float32) * pre_frac).to(tl.int32)
+    offs_g = tl.arange(0, BLOCK_G)
+    g_ok = offs_g < G
+    offs_t = tl.arange(0, BLOCK_T)
+    st = ST + ((b * HKV * G + h * G + offs_g)[:, None] * NT + offs_t[None, :]) * 4
+    st_ok = g_ok[:, None] & (offs_t[None, :] < NT)
+    mt = tl.load(st, mask=st_ok, other=float("-inf"))
+    zt = tl.load(st + 1, mask=st_ok, other=0.0)
+    mx = tl.max(mt, axis=1)
+    lse = mx + tl.log(
+        tl.sum(tl.where(zt > 0, zt * tl.exp(mt - mx[:, None]), 0.0), axis=1)
+    )
+    lse2 = lse
+    if MEAN:
+        mt = tl.load(st + 2, mask=st_ok, other=float("-inf"))
+        zt = tl.load(st + 3, mask=st_ok, other=0.0)
+        mx = tl.max(mt, axis=1)
+        lse2 = mx + tl.log(
+            tl.sum(tl.where(zt > 0, zt * tl.exp(mt - mx[:, None]), 0.0), axis=1)
+        )
+    row = b * stride_sb + (h * G + offs_g)[:, None] * stride_sh
+    kb = KEY + b * stride_cb + h * stride_ch
+    lo = tl.zeros([], tl.int32)
+    hi = cur_p
+    keep_lo = tl.zeros([], tl.int32)
+    n_take = n_keep
+    n_union = n_keep
+    if REGION > 0:
+        lo = tl.program_id(1) * REGION
+        hi = tl.minimum(lo + REGION, cur_p)
+        offs_r = tl.arange(0, BLOCK_R)
+        r_lo = offs_r * REGION
+        r_hi = tl.minimum(r_lo + REGION, cur_p)
+        f_lo = tl.maximum(tl.minimum(r_lo, cur_p - LOCAL) - SINK, 0)
+        f_hi = tl.maximum(tl.minimum(r_hi, cur_p - LOCAL) - SINK, 0)
+        n_free = tl.where(r_lo < cur_p, tl.maximum(f_hi - f_lo, 0), 0)
+        # ranking probability per tile, summed over the group's query heads
+        mt = tl.load(st, mask=st_ok, other=float("-inf"))
+        zt = tl.load(st + 1, mask=st_ok, other=0.0)
+        tm = tl.sum(tl.where(st_ok, zt * tl.exp(mt - lse[:, None]), 0.0), axis=0)
+        if MEAN:
+            mt = tl.load(st + 2, mask=st_ok, other=float("-inf"))
+            zt = tl.load(st + 3, mask=st_ok, other=0.0)
+            tm += tl.sum(tl.where(st_ok, zt * tl.exp(mt - lse2[:, None]), 0.0), axis=0)
+        # minus the forced blocks (sink, then local, overlaps counted once)
+        offs_f = tl.arange(0, BLOCK_F)
+        fpos = tl.where(offs_f < SINK, offs_f, cur_p - LOCAL + offs_f - SINK)
+        f_ok = (offs_f < SINK + LOCAL) & (fpos >= 0) & (fpos < cur_p)
+        f_ok = f_ok & ((offs_f < SINK) | (fpos >= SINK))
+        okf = g_ok[:, None] & f_ok[None, :]
+        sf = tl.load(S + row + fpos[None, :], mask=okf, other=0.0)
+        pf = tl.sum(tl.where(okf, tl.exp(sf - lse[:, None]), 0.0), axis=0)
+        if MEAN:
+            sf = tl.load(S2 + row + fpos[None, :], mask=okf, other=0.0)
+            pf += tl.sum(tl.where(okf, tl.exp(sf - lse2[:, None]), 0.0), axis=0)
+        tm -= tl.sum(
+            tl.where((fpos // 64)[None, :] == offs_t[:, None], pf[None, :], 0.0), 1
+        )
+        TPR: tl.constexpr = REGION // 64
+        rm = tl.sum(
+            tl.where(
+                (offs_t // TPR)[None, :] == offs_r[:, None],
+                tl.maximum(tm, 0.0)[None, :],
+                0.0,
+            ),
+            axis=1,
+        )
+        fsum = tl.maximum(tl.sum(n_free, axis=0), 1).to(tl.float32)
+        msum = tl.sum(rm, axis=0)
+        w = n_free.to(tl.float32) / fsum
+        w = tl.where(msum > 0, alpha * w + (1.0 - alpha) * rm / msum, w)
+        h_r = tl.minimum(tl.ceil(tl.cumsum(w, axis=0) * n_keep.to(tl.float32)), n_keep)
+        h_r = h_r.to(tl.int32)
+        h_prev = tl.sum(
+            tl.where(offs_r[None, :] == offs_r[:, None] - 1, h_r[None, :], 0), axis=1
+        )
+        k_r = tl.maximum(tl.minimum(h_r - h_prev, n_free), 0)
+        o_r = tl.cumsum(k_r, axis=0) - k_r
+        me = offs_r == tl.program_id(1)
+        n_take = tl.sum(tl.where(me, k_r, 0), axis=0)
+        keep_lo = tl.sum(tl.where(me, o_r, 0), axis=0)
+        n_union = tl.sum(k_r, axis=0)
+    NB: tl.constexpr = 1 << DIGIT
+    TOP: tl.constexpr = 32 - DIGIT
+    bins = tl.arange(0, NB)
+    hist = tl.zeros([NB], tl.int32)
+    for c0 in range(lo, hi, CHUNK):
+        offs_p = c0 + tl.arange(0, CHUNK)
+        valid = offs_p < hi
+        free = valid & (offs_p >= SINK) & (offs_p < cur_p - LOCAL)
+        ok = g_ok[:, None] & valid[None, :]
+        x = tl.load(S + row + offs_p[None, :], mask=ok, other=0.0)
+        x = tl.where(ok, x - lse[:, None], float("-inf"))
+        m = tl.max(x, axis=0)
+        if MEAN:
+            x2 = tl.load(S2 + row + offs_p[None, :], mask=ok, other=0.0)
+            x2 = tl.where(ok, x2 - lse2[:, None], float("-inf"))
+            m = tl.maximum(m, tl.max(x2, axis=0))
+        m = tl.where(free, m, 0.0)
+        z = tl.sum(tl.exp(x - m[None, :]), axis=0)
+        if MEAN:
+            z += tl.sum(tl.exp(x2 - m[None, :]), axis=0)
+        key = _ordered_key(tl.where(free, m + tl.log(z), -1e30))
+        tl.store(kb + offs_p, key, mask=valid)
+        hist += tl.histogram(((key >> TOP) + NB // 2) & (NB - 1), NB, mask=free)
+    # Radix select, most significant digit first (the top one is signed, hence + NB/2).
+    # k counts how many keys are still wanted from the current digit's bin downward.
+    k = n_take
+    t = tl.zeros([], tl.int32)
+    for i in tl.static_range(32 // DIGIT):
+        s = TOP - DIGIT * i
+        if i > 0:
+            hist = tl.zeros([NB], tl.int32)
+            for c0 in range(lo, hi, CHUNK):
+                offs_p = c0 + tl.arange(0, CHUNK)
+                free = (offs_p < hi) & (offs_p >= SINK) & (offs_p < cur_p - LOCAL)
+                key = tl.load(kb + offs_p, mask=free, other=0)
+                hit = free & ((key >> (s + DIGIT)) == (t >> (s + DIGIT)))
+                hist += tl.histogram((key >> s) & (NB - 1), NB, mask=hit)
+        ge = tl.sum(hist, axis=0) - tl.cumsum(hist, axis=0) + hist  # count >= bin
+        d = tl.max(tl.where(ge >= k, bins, 0), axis=0)
+        k -= tl.sum(tl.where(bins == d, ge - hist, 0), axis=0)
+        if i == 0:
+            t = (d - NB // 2) * (1 << TOP)
+        else:
+            t = t | (d << s)
+    # t is now the n_take-th largest key: keep every free block above it and the first
+    # k of those equal to it. Forced blocks take the leading slots in block order (sink,
+    # then local), union blocks the rest; when sink and local overlap every block is
+    # forced and its slot is its index.
+    nu = tl.zeros([], tl.int32)
+    nt = tl.zeros([], tl.int32)
+    for c0 in range(lo, hi, CHUNK):
+        offs_p = c0 + tl.arange(0, CHUNK)
+        valid = offs_p < hi
+        forced = valid & ((offs_p < SINK) | (offs_p >= cur_p - LOCAL))
+        key = tl.load(kb + offs_p, mask=valid, other=0)
+        free = valid & (~forced) & (n_take > 0)
+        tie = free & (key == t)
+        tie_rank = nt + tl.cumsum(tie.to(tl.int32), axis=0) - 1
+        union = free & ((key > t) | (tie & (tie_rank < k)))
+        nt += tl.sum(tie.to(tl.int32), axis=0)
+        slot = tl.where(
+            forced,
+            tl.where(offs_p < SINK, offs_p, n_forced - (cur_p - offs_p)),
+            n_forced + keep_lo + nu + tl.cumsum(union.to(tl.int32), axis=0) - 1,
+        )
+        tl.store(
+            CAND + b * stride_cb + h * stride_ch + slot,
+            offs_p.to(tl.int32),
+            mask=forced | union,
+        )
+        tl.store(
+            ISC + b * stride_cb + h * stride_ch + offs_p,
+            (forced | union).to(tl.int8),
+            mask=valid,
+        )
+        nu += tl.sum(union.to(tl.int32), axis=0)
+    if tl.program_id(1) == 0:
+        tl.store(NCAND + b * HKV + h, n_forced + n_union)
+        tl.store(NFORCED + b * HKV + h, n_forced)
+
+
+@triton.jit
 def _block_mass_kernel(
     Q,
     K8,
@@ -1247,6 +1492,7 @@ def _block_mass_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     D: tl.constexpr,
+    STAGES: tl.constexpr = 1,
 ):
     pid_bh = tl.program_id(0)
     b = (pid_bh // HKV).to(tl.int64)
@@ -1264,7 +1510,7 @@ def _block_mass_kernel(
     ncand = tl.load(NCAND + b * HKV + h)
     start = tl.program_id(1) * SLOTS_PER_SPLIT
     end = tl.minimum(start + SLOTS_PER_SPLIT, ncand)
-    for j in range(start, end):
+    for j in tl.range(start, end, num_stages=STAGES):
         blk = tl.load(CAND + b * stride_cb + h * stride_ch + j)
         tok = blk * BLOCK_N + offs_n
         ok = tok < N
@@ -1278,8 +1524,9 @@ def _block_mass_kernel(
             other=0,
         )
         ks = tl.load(KS + b * stride_sb + h * stride_sh + tok, mask=ok, other=0.0)
-        k = (k8.to(tl.float32) * ks[:, None]).to(q.dtype)
-        s = tl.dot(q, tl.trans(k))
+        # int8 values are exact in bf16; each token's scale is applied to its logit after
+        # the dot, so no dequantized key is rounded (and nothing is dequantized).
+        s = tl.dot(q, tl.trans(k8.to(q.dtype))) * ks[None, :]
         s = tl.where(ok[None, :], s, float("-inf"))
         m = tl.max(s, axis=1)
         lse = m + tl.log(tl.sum(tl.exp(s - m[:, None]), axis=1))
@@ -1397,6 +1644,140 @@ def _final_select_kernel(
     )
 
 
+@triton.jit
+def _group_log_mean(s, lse, ok, G: tl.constexpr):
+    """log of the mean over query heads (rows) of exp(s - lse); -inf where none is ok."""
+    x = tl.where(ok, s - lse[:, None], float("-inf"))
+    m = tl.max(x, axis=0)
+    m = tl.where(m == float("-inf"), 0.0, m)
+    return m + tl.log(tl.sum(tl.exp(x - m[None, :]), axis=0) / G)
+
+
+@triton.jit
+def _final_select_split_kernel(
+    L,
+    CAND,
+    NCAND,
+    NFORCED,
+    IDX,
+    CNT,
+    KEPT,
+    stride_lb,
+    stride_lh,
+    stride_cb,
+    stride_ch,
+    stride_ib,
+    stride_ih,
+    HKV,
+    CAP,
+    MAXC,
+    tau,
+    floor_frac,
+    G: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    ITERS: tl.constexpr,
+    RADIX: tl.constexpr = 2,
+    SORT: tl.constexpr = False,
+):
+    # _final_select_kernel with the forced candidates (the leading NFORCED slots) in
+    # their own small tile, so the sort or search spans only the free candidates, and
+    # every query head's block log-softmax taken at once from one [heads, slots] tile.
+    # Candidate slots past MAXC were never scored by the mass kernel and are ignored.
+    pid = tl.program_id(0)
+    b = (pid // HKV).to(tl.int64)
+    h = pid % HKV
+    ncand = tl.minimum(tl.load(NCAND + b * HKV + h), MAXC)
+    nf = tl.load(NFORCED + b * HKV + h)
+    offs_g = tl.arange(0, BLOCK_G)
+    g_ok = offs_g < G
+    rows = L + b * stride_lb + (h * G + offs_g)[:, None] * stride_lh
+    offs_c = tl.arange(0, BLOCK_C)
+    forced = offs_c < nf
+    ok_c = g_ok[:, None] & forced[None, :]
+    sc = tl.load(rows + offs_c[None, :], mask=ok_c, other=float("-inf"))
+    offs = tl.arange(0, BLOCK_P)  # free candidate j sits in slot nf + j
+    free = nf + offs < ncand
+    ok_f = g_ok[:, None] & free[None, :]
+    sf = tl.load(rows + (nf + offs)[None, :], mask=ok_f, other=float("-inf"))
+    mx = tl.maximum(tl.max(sc, axis=1), tl.max(sf, axis=1))
+    mx = tl.where(mx == float("-inf"), 0.0, mx)
+    lse = mx + tl.log(
+        tl.sum(tl.exp(sc - mx[:, None]), axis=1)
+        + tl.sum(tl.exp(sf - mx[:, None]), axis=1)
+    )
+    forced_mass = tl.sum(
+        tl.where(forced, tl.exp(_group_log_mean(sc, lse, ok_c, G)), 0.0), axis=0
+    )
+    lp = _group_log_mean(sf, lse, ok_f, G)
+    lp = tl.where(free & (lp > -1e30), lp, -1e30)
+    k_floor = tl.ceil(ncand.to(tl.float32) * floor_frac)
+    cap_free = (CAP - nf).to(tl.float32)
+    if SORT:
+        ls = tl.sort(lp, descending=True)
+        real = ls > -1e30
+        ps = tl.where(real, tl.exp(ls), 0.0)
+        before = tl.cumsum(ps, axis=0) - ps
+        n_cdf = tl.sum((real & (forced_mass + before < tau)).to(tl.float32), axis=0)
+        n_real = tl.sum(real.to(tl.float32), axis=0)
+        n = tl.minimum(tl.minimum(tl.maximum(n_cdf, k_floor), cap_free), n_real)
+        t = tl.sum(tl.where(offs == n.to(tl.int32) - 1, ls, 0.0), axis=0)
+        t = tl.where(n >= 1, t, float("inf"))
+    else:
+        probs = tl.where(free, tl.exp(lp), 0.0)
+        top = tl.max(lp, axis=0)
+        lo_c = top - 60.0
+        hi_c = top
+        lo_k = top - 60.0
+        hi_k = top
+        lo_x = top - 60.0
+        hi_x = top
+        ones = tl.full([BLOCK_P], 1.0, tl.float32)
+        for _ in range(ITERS):
+            lo_c, hi_c = _search_round(
+                lp, probs, free, lo_c, hi_c, tau - forced_mass, RADIX, False
+            )
+            lo_k, hi_k = _search_round(
+                lp, ones, free, lo_k, hi_k, k_floor, RADIX, False
+            )
+            lo_x, hi_x = _search_round(
+                lp, ones, free, lo_x, hi_x, cap_free, RADIX, True
+            )
+        t = tl.maximum(tl.minimum(lo_c, lo_k), hi_x)
+    chosen = free & (lp >= t) & (lp > -1e30)
+    slot = nf + tl.cumsum(chosen.to(tl.int32), axis=0) - 1
+    cb = CAND + b * stride_cb + h * stride_ch
+    ib = IDX + b * stride_ib + h * stride_ih
+    tl.store(
+        ib + offs_c,
+        tl.load(cb + offs_c, mask=forced, other=0),
+        mask=forced & (offs_c < CAP),
+    )
+    blk = tl.load(cb + nf + offs, mask=free, other=0)
+    tl.store(ib + slot, blk, mask=chosen & (slot < CAP))
+    n_sel = tl.minimum(nf + tl.sum(chosen.to(tl.int32), axis=0), CAP)
+    tl.store(CNT + b * HKV + h, n_sel)
+    # Zero the unused index slots so callers may scatter over all CAP slots (the host
+    # makes BLOCK_P >= CAP).
+    tl.store(
+        ib + offs, tl.zeros([BLOCK_P], tl.int32), mask=(offs >= n_sel) & (offs < CAP)
+    )
+    kb = KEPT + b * stride_cb + h * stride_ch
+    tl.store(kb + offs_c, (offs_c < CAP).to(tl.int8), mask=forced)
+    tl.store(kb + nf + offs, (chosen & (slot < CAP)).to(tl.int8), mask=free)
+
+
+def _keep_count(n: int, frac: float) -> int:
+    """ceil(n * frac) in fp32, as the prefilter kernels compute it."""
+    return math.ceil(
+        (
+            torch.tensor(n, dtype=torch.float32)
+            * torch.tensor(frac, dtype=torch.float32)
+        ).item()
+    )
+
+
 @torch.no_grad()
 def select_blocks_two_stage(
     q: torch.Tensor,
@@ -1443,12 +1824,13 @@ def select_blocks_two_stage(
     scores2 = torch.empty_like(scores) if has_s2 else scores
     nt = triton.cdiv(P, 64)
     stats = prefilter_shared and bool(TUNE["prefilter_stats"])
+    live = stats and TUNE["prefilter_chunk"] > 0
+    e1 = e2 = tile_stats = scores
     if stats:
+        tile_stats = torch.empty(B, Hq, nt, 4, device=dev, dtype=torch.float32)
+    if stats and not live:
         e1 = torch.empty_like(scores)
         e2 = torch.empty_like(scores) if has_s2 else scores
-        tile_stats = torch.empty(B, Hq, nt, 4, device=dev, dtype=torch.float32)
-    else:
-        e1 = e2 = tile_stats = scores
     _block_scores_kernel[(B * Hkv, nt)](
         q,
         kmin,
@@ -1477,6 +1859,7 @@ def select_blocks_two_stage(
         D=D,
         MEAN=has_s2,
         STATS=stats,
+        STORE_E=not live,
     )
     # Every buffer below is written over the range its readers use (candidate slots
     # < ncand, blocks < cur_p, index slots < CAP), so none needs a fill kernel.
@@ -1484,45 +1867,88 @@ def select_blocks_two_stage(
     isc = torch.empty(B, Hkv, P, device=dev, dtype=torch.int8)
     ncand = torch.empty(B, Hkv, device=dev, dtype=torch.int32)
     nforced = torch.empty_like(ncand)
-    _prefilter_kernel[(B * Hkv,)](
-        scores,
-        e1,
-        scores2,
-        e2,
-        tile_stats,
-        cand,
-        isc,
-        ncand,
-        nforced,
-        seq_len,
-        scores.stride(0),
-        scores.stride(1),
-        cand.stride(0),
-        cand.stride(1),
-        Hkv,
-        block_size,
-        sink_blocks,
-        local_blocks,
-        prefilter_fraction,
-        nt,
-        G=G,
-        BLOCK_P=bp,
-        ITERS=_rounds(30, TUNE["search_radix"]),
-        SHARED=prefilter_shared,
-        MEAN=prefilter_mean,
-        RADIX=TUNE["search_radix"],
-        SORT=bp <= TUNE["sort_max_blocks"],
-        STATS=stats,
-        BLOCK_T=triton.next_power_of_2(nt),
-        num_warps=_warps(TUNE["prefilter_warps"], bp),
-    )
+    if live:
+        region = TUNE["prefilter_region"]
+        assert region % 64 == 0, "regions are whole tiles of the scores kernel"
+        _prefilter_live_kernel[(B * Hkv, triton.cdiv(P, region) if region else 1)](
+            scores,
+            scores2,
+            tile_stats,
+            torch.empty_like(cand),
+            cand,
+            isc,
+            ncand,
+            nforced,
+            seq_len,
+            scores.stride(0),
+            scores.stride(1),
+            cand.stride(0),
+            cand.stride(1),
+            Hkv,
+            block_size,
+            sink_blocks,
+            local_blocks,
+            prefilter_fraction,
+            nt,
+            float(TUNE["prefilter_region_alpha"]),
+            G=G,
+            BLOCK_G=triton.next_power_of_2(G),
+            CHUNK=TUNE["prefilter_chunk"],
+            BLOCK_T=triton.next_power_of_2(nt),
+            MEAN=prefilter_mean,
+            DIGIT=TUNE["prefilter_digit"],
+            REGION=region,
+            BLOCK_R=triton.next_power_of_2(triton.cdiv(P, region)) if region else 1,
+            BLOCK_F=triton.next_power_of_2(max(1, sink_blocks + local_blocks)),
+            num_warps=TUNE["prefilter_chunk_warps"],
+        )
+    else:
+        _prefilter_kernel[(B * Hkv,)](
+            scores,
+            e1,
+            scores2,
+            e2,
+            tile_stats,
+            cand,
+            isc,
+            ncand,
+            nforced,
+            seq_len,
+            scores.stride(0),
+            scores.stride(1),
+            cand.stride(0),
+            cand.stride(1),
+            Hkv,
+            block_size,
+            sink_blocks,
+            local_blocks,
+            prefilter_fraction,
+            nt,
+            G=G,
+            BLOCK_P=bp,
+            ITERS=_rounds(30, TUNE["search_radix"]),
+            SHARED=prefilter_shared,
+            MEAN=prefilter_mean,
+            RADIX=TUNE["search_radix"],
+            SORT=bp <= TUNE["sort_max_blocks"],
+            STATS=stats,
+            BLOCK_T=triton.next_power_of_2(nt),
+            num_warps=_warps(TUNE["prefilter_warps"], bp),
+        )
     lse = torch.empty(B, Hq, P, device=dev, dtype=torch.float32)
     pk = torch.empty_like(lse)
     # Size the grid by the candidate bound, not P: ~4 candidate blocks per program.
-    per_head = math.ceil(prefilter_fraction * P)
-    max_cand = min(
-        P, sink_blocks + local_blocks + (per_head if prefilter_shared else G * per_head)
-    )
+    n_forced = min(P, sink_blocks + local_blocks)
+    if live:  # keeps exactly n_keep free blocks
+        max_cand = n_forced + _keep_count(P - n_forced, prefilter_fraction)
+    else:
+        per_head = math.ceil(prefilter_fraction * P)
+        max_cand = min(
+            P,
+            sink_blocks
+            + local_blocks
+            + (per_head if prefilter_shared else G * per_head),
+        )
     slots = TUNE["mass_slots"]
     splits = triton.cdiv(max_cand, slots)
     _block_mass_kernel[(B * Hkv, splits)](
@@ -1551,40 +1977,72 @@ def select_blocks_two_stage(
         BLOCK_M=bm,
         BLOCK_N=block_size,
         D=D,
+        STAGES=TUNE["mass_stages"],
         num_warps=TUNE["mass_warps"],
     )
-    cap = min(
-        P, min(P, sink_blocks + local_blocks) + max(1, math.ceil(max_fraction * P))
-    )
+    cap = min(P, n_forced + max(1, math.ceil(max_fraction * P)))
     idx = torch.empty(B, Hkv, cap, device=dev, dtype=torch.int32)
     counts = torch.empty(B, Hkv, device=dev, dtype=torch.int32)
     kept = torch.empty(B, Hkv, P, device=dev, dtype=torch.int8)
-    bp_sel = triton.next_power_of_2(max(max_cand, cap))
-    _final_select_kernel[(B * Hkv,)](
-        lse,
-        cand,
-        ncand,
-        nforced,
-        idx,
-        counts,
-        kept,
-        lse.stride(0),
-        lse.stride(1),
-        cand.stride(0),
-        cand.stride(1),
-        idx.stride(0),
-        idx.stride(1),
-        Hkv,
-        cap,
-        cdf_threshold,
-        floor_fraction,
-        G=G,
-        BLOCK_P=bp_sel,  # candidate slots, not P
-        ITERS=_rounds(20, TUNE["search_radix"]),
-        RADIX=TUNE["search_radix"],
-        SORT=bp_sel <= TUNE["sort_max_blocks"],
-        num_warps=_warps(TUNE["final_warps"], bp_sel),
-    )
+    if TUNE["final_split"]:
+        # Free candidates number at most max_cand - n_forced (none while the context is
+        # shorter than the forced blocks); the tile also spans the CAP index slots.
+        bp_sel = triton.next_power_of_2(max(max_cand - n_forced, cap))
+        _final_select_split_kernel[(B * Hkv,)](
+            lse,
+            cand,
+            ncand,
+            nforced,
+            idx,
+            counts,
+            kept,
+            lse.stride(0),
+            lse.stride(1),
+            cand.stride(0),
+            cand.stride(1),
+            idx.stride(0),
+            idx.stride(1),
+            Hkv,
+            cap,
+            max_cand,
+            cdf_threshold,
+            floor_fraction,
+            G=G,
+            BLOCK_G=triton.next_power_of_2(G),
+            BLOCK_C=triton.next_power_of_2(max(1, n_forced)),
+            BLOCK_P=bp_sel,
+            ITERS=_rounds(20, TUNE["search_radix"]),
+            RADIX=TUNE["search_radix"],
+            SORT=bp_sel <= TUNE["sort_max_blocks"],
+            num_warps=_warps(TUNE["final_warps"], bp_sel),
+        )
+    else:
+        bp_sel = triton.next_power_of_2(max(max_cand, cap))
+        _final_select_kernel[(B * Hkv,)](
+            lse,
+            cand,
+            ncand,
+            nforced,
+            idx,
+            counts,
+            kept,
+            lse.stride(0),
+            lse.stride(1),
+            cand.stride(0),
+            cand.stride(1),
+            idx.stride(0),
+            idx.stride(1),
+            Hkv,
+            cap,
+            cdf_threshold,
+            floor_fraction,
+            G=G,
+            BLOCK_P=bp_sel,  # candidate slots, not P
+            ITERS=_rounds(20, TUNE["search_radix"]),
+            RADIX=TUNE["search_radix"],
+            SORT=bp_sel <= TUNE["sort_max_blocks"],
+            num_warps=_warps(TUNE["final_warps"], bp_sel),
+        )
     if return_aux:
         aux = dict(
             s2=scores2,
@@ -1620,8 +2078,14 @@ def select_blocks_two_stage_ref(
     ksum=None,
     prefilter_mean=False,
     return_cand=False,
+    region=0,
+    region_alpha=0.5,
 ):
-    """Readable torch reference of select_blocks_two_stage (same block sets), for tests."""
+    """Readable torch reference of select_blocks_two_stage (same block sets), for tests.
+
+    region / region_alpha: the shared prefilter's per-region quotas (TUNE prefilter_region
+    and prefilter_region_alpha); 0 is the global top.
+    """
     B, Hq, D = q.shape
     Hkv, P = kmin.shape[1], kmin.shape[2]
     G = Hq // Hkv
@@ -1648,9 +2112,25 @@ def select_blocks_two_stage_ref(
         shared = (
             torch.softmax(ranked, -1).mean(2).masked_fill(~free, -1.0)
         )  # [B, Hkv, P]
-        top = torch.zeros_like(shared, dtype=torch.bool).scatter(
-            -1, shared.topk(n_keep, dim=-1).indices, True
-        )
+        if region:
+            # ranked in log space like the kernel: tail probabilities underflow in fp32
+            lshared = torch.logsumexp(torch.log_softmax(ranked, -1), 2).masked_fill(
+                ~free, float("-inf")
+            )
+            top = _region_top_ref(
+                shared,
+                lshared,
+                cur_p,
+                n_keep,
+                region,
+                region_alpha,
+                sink_blocks,
+                local_blocks,
+            )
+        else:
+            top = torch.zeros_like(shared, dtype=torch.bool).scatter(
+                -1, shared.topk(n_keep, dim=-1).indices, True
+            )
     else:
         ranked = ranked.masked_fill(~free, float("-inf"))
         top = (
@@ -1659,9 +2139,11 @@ def select_blocks_two_stage_ref(
             .any(2)
         )
     cand = forced | (top & free)  # [B, Hkv, P]
-    # Round like the kernel: dequantized keys and q in q.dtype, fp32 accumulation.
-    kd = (k8[:, :, :n].float() * kscale[:, :, :n, None]).to(q.dtype).float()
-    tok_logits = torch.einsum("bhgd,bhnd->bhgn", qg, kd)
+    # Like the kernel: q in q.dtype times the int8 keys, then each token's scale.
+    tok_logits = (
+        torch.einsum("bhgd,bhnd->bhgn", qg, k8[:, :, :n].float())
+        * kscale[:, :, None, :n]
+    )
     pad = cur_p * block_size - n
     tok_logits = torch.nn.functional.pad(tok_logits, (0, pad), value=float("-inf"))
     mass = torch.logsumexp(tok_logits.view(B, Hkv, G, cur_p, block_size), -1)
@@ -1697,6 +2179,40 @@ def select_blocks_two_stage_ref(
     if return_cand:
         return idx, counts, cand
     return idx, counts
+
+
+def _region_top_ref(shared, lshared, cur_p, n_keep, region, alpha, sink, local):
+    """Per-region top sets of the shared prefilter, with the kernel's quotas: each region's
+    share mixes its free-block share (weight alpha) and its ranking-probability share
+    (from shared), rounded cumulatively from n_keep and capped at its free blocks; blocks
+    are ranked within a region by lshared, the log of the same probabilities."""
+    starts = list(range(0, cur_p, region))
+    nf = torch.tensor(
+        [
+            max(0, min(min(lo + region, cur_p), cur_p - local) - sink)
+            - max(0, min(lo, cur_p - local) - sink)
+            for lo in starts
+        ],
+        device=shared.device,
+    )
+    mass = torch.stack(
+        [
+            shared[..., lo : min(lo + region, cur_p)].clamp_min(0).sum(-1)
+            for lo in starts
+        ],
+        -1,
+    )  # [B, Hkv, regions]
+    w = (nf / nf.sum().clamp_min(1)).expand_as(mass)
+    msum = mass.sum(-1, keepdim=True)
+    w = torch.where(msum > 0, alpha * w + (1 - alpha) * mass / msum, w)
+    hr = torch.ceil(torch.cumsum(w, -1) * n_keep).clamp(max=n_keep).long()
+    k = (hr - torch.nn.functional.pad(hr, (1, 0))[..., :-1]).minimum(nf).clamp_min(0)
+    top = torch.zeros_like(shared, dtype=torch.bool)
+    for r, lo in enumerate(starts):
+        part = lshared[..., lo : min(lo + region, cur_p)]
+        rank = part.argsort(-1, descending=True).argsort(-1)
+        top[..., lo : lo + part.shape[-1]] = rank < k[..., r : r + 1]
+    return top
 
 
 def _block_token_counts(P, block_size, n, device):
@@ -1763,8 +2279,10 @@ def two_stage_tail_ref(
     )
     num = torch.einsum("bhgpt,bhptd->bhgd", e, vb)
     den = e.sum((-1, -2))
-    kd = (k8[:, :, :n].float() * kscale[:, :, :n, None]).to(q.dtype).float()
-    l8 = blocked(torch.einsum("bhgd,bhnd->bhgn", qg, kd))
+    l8 = blocked(
+        torch.einsum("bhgd,bhnd->bhgn", qg, k8[:, :, :n].float())
+        * kscale[:, :, None, :n]
+    )
     lse = torch.logsumexp(l8, -1)
     peak = l8.amax(-1) - lse
     cnt = _block_token_counts(cur_p, block_size, n, q.device)
