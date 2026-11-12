@@ -720,31 +720,64 @@ def _append_kernel(
     KMAX,
     KSUM,
     VSUM,
+    K8,
+    KS,
     POS,
+    SEQ,
     stride_nb,
     stride_nh,
+    stride_nn,
     stride_kb,
     stride_kh,
     stride_kn,
     stride_mb,
     stride_mh,
     stride_mp,
+    stride_8b,
+    stride_8h,
+    stride_8n,
+    stride_sb,
+    stride_sh,
     HKV,
     BS,
     D: tl.constexpr,
     META: tl.constexpr,
     SUMS: tl.constexpr,
+    STORE: tl.constexpr,
+    Q8: tl.constexpr,
+    SEQ_OUT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     b = (pid // HKV).to(tl.int64)
     h = pid % HKV
     offs_d = tl.arange(0, D)
     pos = tl.load(POS)
-    k = tl.load(KNEW + b * stride_nb + h * stride_nh + offs_d)
-    v = tl.load(VNEW + b * stride_nb + h * stride_nh + offs_d)
-    kv = b * stride_kb + h * stride_kh + pos * stride_kn + offs_d
-    tl.store(KBUF + kv, k)
-    tl.store(VBUF + kv, v)
+    if SEQ_OUT:
+        if pid == 0:
+            tl.store(SEQ, (pos + 1).to(tl.int32))
+    knew = b * stride_nb + h * stride_nh + pos * stride_nn + offs_d
+    k = tl.load(KNEW + knew)
+    v = tl.load(VNEW + knew)
+    if STORE:
+        kv = b * stride_kb + h * stride_kh + pos * stride_kn + offs_d
+        tl.store(KBUF + kv, k)
+        tl.store(VBUF + kv, v)
+    if Q8:
+        kf = k.to(tl.float32)
+        scale = tl.maximum(tl.max(tl.abs(kf), axis=0), 1e-8) / 127.0
+        # As _append_q8_kernel: IEEE division, bit for bit with quantize_keys.
+        q8 = tl.minimum(
+            tl.maximum(
+                tl.extra.cuda.libdevice.rint(tl.extra.cuda.libdevice.div_rn(kf, scale)),
+                -127.0,
+            ),
+            127.0,
+        )
+        tl.store(
+            K8 + b * stride_8b + h * stride_8h + pos * stride_8n + offs_d,
+            q8.to(tl.int8),
+        )
+        tl.store(KS + b * stride_sb + h * stride_sh + pos, scale)
     if META:
         mp = b * stride_mb + h * stride_mh + (pos // BS) * stride_mp + offs_d
         if pos % BS == 0:
@@ -774,19 +807,36 @@ def append_kv(
     block_size: int = 64,
     ksum=None,
     vsum=None,
+    k8=None,
+    kscale=None,
+    seq_out=None,
 ) -> None:
     """Write one decode token's K/V ([B, Hkv, D] or [B, Hkv, 1, D]) at position pos (device
     scalar) and, when kmin/kmax are given, fold it into its block's channel min/max (and,
-    when ksum/vsum [B, Hkv, P, D] fp32 are given, into its block's K and V sums)."""
+    when ksum/vsum [B, Hkv, P, D] fp32 are given, into its block's K and V sums).
+
+    k_new=None and v_new=None: the token is already in k_buf/v_buf at pos (e.g. HF's cache
+    wrote it); it is read from there. k8/kscale: also quantize its keys into the int8 copy
+    (as append_k8). seq_out: a 1-element int32 tensor that receives pos + 1."""
     B, Hkv = k_buf.shape[0], k_buf.shape[1]
-    k_new = k_new.reshape(B, Hkv, -1).contiguous()
-    v_new = v_new.reshape(B, Hkv, -1).contiguous()
+    store = k_new is not None
+    if store:
+        k_new = k_new.reshape(B, Hkv, -1).contiguous()
+        v_new = v_new.reshape(B, Hkv, -1).contiguous()
+        new_strides = (k_new.stride(0), k_new.stride(1), 0)
+    else:
+        assert k_buf.stride() == v_buf.stride()
+        k_new, v_new = k_buf, v_buf
+        new_strides = k_buf.stride()[:3]
     meta = kmin is not None
     sums = ksum is not None
+    q8 = k8 is not None
     if not meta:
         kmin = kmax = k_buf
     if not sums:
         ksum = vsum = kmin
+    if not q8:
+        k8, kscale = k_buf, pos
     assert not (sums and meta) or ksum.stride() == kmin.stride()
     _append_kernel[(B * Hkv,)](
         k_new,
@@ -797,20 +847,30 @@ def append_kv(
         kmax,
         ksum,
         vsum,
+        k8,
+        kscale,
         pos,
-        k_new.stride(0),
-        k_new.stride(1),
+        pos if seq_out is None else seq_out,
+        *new_strides,
         k_buf.stride(0),
         k_buf.stride(1),
         k_buf.stride(2),
         kmin.stride(0),
         kmin.stride(1),
         kmin.stride(2),
+        k8.stride(0),
+        k8.stride(1),
+        k8.stride(2),
+        kscale.stride(0) if q8 else 0,
+        kscale.stride(1) if q8 else 0,
         Hkv,
         block_size,
         D=k_buf.shape[-1],
         META=meta,
         SUMS=sums,
+        STORE=store,
+        Q8=q8,
+        SEQ_OUT=seq_out is not None,
     )
 
 
@@ -1269,6 +1329,9 @@ def _prefilter_live_kernel(
     pre_frac,
     NT,
     alpha,
+    SC,
+    stride_scb,
+    carry_thr,
     G: tl.constexpr,
     BLOCK_G: tl.constexpr,
     CHUNK: tl.constexpr,
@@ -1278,6 +1341,7 @@ def _prefilter_live_kernel(
     REGION: tl.constexpr = 0,
     BLOCK_R: tl.constexpr = 1,
     BLOCK_F: tl.constexpr = 1,
+    CARRY: tl.constexpr = False,
 ):
     # The shared prefilter with work proportional to the live length: block scores are
     # walked in CHUNK-wide pieces up to cur_p (read on device, so CUDA graphs still see a
@@ -1297,6 +1361,10 @@ def _prefilter_live_kernel(
     # most of the mass so gets most of the candidates. Every program derives all quotas
     # the same way, so slot offsets agree without communication. Quotas are cumulative
     # roundings of n_keep (capped at a region's free blocks), so they never exceed it.
+    # pre_frac >= 1 is a full scan: every region keeps all its free blocks, exactly.
+    # CARRY: a free block whose carried score SC [B, P] is at least carry_thr outranks
+    # every other block of its region, so it is a candidate whatever this step's ranking
+    # says; the quotas are unchanged, so carried blocks take slots from the lowest ranked.
     pid = tl.program_id(0)
     b = (pid // HKV).to(tl.int64)
     h = pid % HKV
@@ -1379,6 +1447,7 @@ def _prefilter_live_kernel(
             tl.where(offs_r[None, :] == offs_r[:, None] - 1, h_r[None, :], 0), axis=1
         )
         k_r = tl.maximum(tl.minimum(h_r - h_prev, n_free), 0)
+        k_r = tl.where(pre_frac >= 1.0, n_free, k_r)
         o_r = tl.cumsum(k_r, axis=0) - k_r
         me = offs_r == tl.program_id(1)
         n_take = tl.sum(tl.where(me, k_r, 0), axis=0)
@@ -1404,7 +1473,11 @@ def _prefilter_live_kernel(
         z = tl.sum(tl.exp(x - m[None, :]), axis=0)
         if MEAN:
             z += tl.sum(tl.exp(x2 - m[None, :]), axis=0)
-        key = _ordered_key(tl.where(free, m + tl.log(z), -1e30))
+        rank = tl.where(free, m + tl.log(z), -1e30)
+        if CARRY:
+            sc = tl.load(SC + b * stride_scb + offs_p, mask=free, other=0.0)
+            rank = tl.where(free & (sc >= carry_thr), 1e30, rank)
+        key = _ordered_key(rank)
         tl.store(kb + offs_p, key, mask=valid)
         hist += tl.histogram(((key >> TOP) + NB // 2) & (NB - 1), NB, mask=free)
     # Radix select, most significant digit first (the top one is signed, hence + NB/2).
@@ -1673,6 +1746,8 @@ def _final_select_split_kernel(
     MAXC,
     tau,
     floor_frac,
+    SC,
+    stride_scb,
     G: tl.constexpr,
     BLOCK_G: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -1680,6 +1755,7 @@ def _final_select_split_kernel(
     ITERS: tl.constexpr,
     RADIX: tl.constexpr = 2,
     SORT: tl.constexpr = False,
+    CARRY: tl.constexpr = False,
 ):
     # _final_select_kernel with the forced candidates (the leading NFORCED slots) in
     # their own small tile, so the sort or search spans only the free candidates, and
@@ -1712,6 +1788,18 @@ def _final_select_split_kernel(
     )
     lp = _group_log_mean(sf, lse, ok_f, G)
     lp = tl.where(free & (lp > -1e30), lp, -1e30)
+    if CARRY:
+        # Raise each free candidate's carried score to the largest stage-2 probability
+        # any of the group's query heads gives it. The KV heads of a batch row write the
+        # same row, hence the atomic; probabilities are >= 0, so their fp32 bit patterns
+        # order like the values and SC is the score buffer viewed as int32.
+        pm = tl.exp(tl.max(tl.where(ok_f, sf - lse[:, None], float("-inf")), axis=0))
+        cblk = tl.load(
+            CAND + b * stride_cb + h * stride_ch + nf + offs, mask=free, other=0
+        )
+        tl.atomic_max(
+            SC + b * stride_scb + cblk, pm.to(tl.int32, bitcast=True), mask=free
+        )
     k_floor = tl.ceil(ncand.to(tl.float32) * floor_frac)
     cap_free = (CAP - nf).to(tl.float32)
     if SORT:
@@ -1797,6 +1885,8 @@ def select_blocks_two_stage(
     ksum: Optional[torch.Tensor] = None,
     prefilter_mean: bool = False,
     return_aux: bool = False,
+    carry_score: Optional[torch.Tensor] = None,
+    carry_threshold: float = 0.0,
 ):
     """Bound prefilter -> int8 block mass on candidates -> TopCdf + floor, per KV head.
 
@@ -1805,6 +1895,12 @@ def select_blocks_two_stage(
     ksum: [B, Hkv, P, D] fp32 block key sums; with it the block-mean-key scores are
     computed too, and prefilter_mean ranks candidates by the average of the bound and
     mean-key softmaxes. return_aux also returns the intermediates the tail estimate uses.
+    prefilter_fraction >= 1 scans every block (no block is dropped before the block mass).
+    carry_score: [B, P] fp32, one row per batch row shared by every layer and KV head of
+    the model. Free blocks scoring at least carry_threshold are candidates whatever the
+    prefilter ranks them (in place of its lowest-ranked ones), and each free candidate's
+    score is raised in place to the largest stage-2 probability a query head gives it.
+    The caller decays the scores between decode steps.
     """
     B, Hq, D = q.shape
     Hkv, P = kmin.shape[1], kmin.shape[2]
@@ -1825,6 +1921,11 @@ def select_blocks_two_stage(
     nt = triton.cdiv(P, 64)
     stats = prefilter_shared and bool(TUNE["prefilter_stats"])
     live = stats and TUNE["prefilter_chunk"] > 0
+    carry = carry_score is not None
+    if carry:
+        assert live and TUNE["final_split"], "carrying needs the live prefilter"
+        assert carry_score.shape == (B, P) and carry_score.dtype == torch.float32
+        assert carry_score.is_contiguous() and carry_threshold > 0
     e1 = e2 = tile_stats = scores
     if stats:
         tile_stats = torch.empty(B, Hq, nt, 4, device=dev, dtype=torch.float32)
@@ -1891,6 +1992,9 @@ def select_blocks_two_stage(
             prefilter_fraction,
             nt,
             float(TUNE["prefilter_region_alpha"]),
+            carry_score if carry else scores,
+            carry_score.stride(0) if carry else 0,
+            float(carry_threshold),
             G=G,
             BLOCK_G=triton.next_power_of_2(G),
             CHUNK=TUNE["prefilter_chunk"],
@@ -1900,6 +2004,7 @@ def select_blocks_two_stage(
             REGION=region,
             BLOCK_R=triton.next_power_of_2(triton.cdiv(P, region)) if region else 1,
             BLOCK_F=triton.next_power_of_2(max(1, sink_blocks + local_blocks)),
+            CARRY=carry,
             num_warps=TUNE["prefilter_chunk_warps"],
         )
     else:
@@ -2007,6 +2112,8 @@ def select_blocks_two_stage(
             max_cand,
             cdf_threshold,
             floor_fraction,
+            carry_score.view(torch.int32) if carry else cand,
+            carry_score.stride(0) if carry else 0,
             G=G,
             BLOCK_G=triton.next_power_of_2(G),
             BLOCK_C=triton.next_power_of_2(max(1, n_forced)),
@@ -2014,6 +2121,7 @@ def select_blocks_two_stage(
             ITERS=_rounds(20, TUNE["search_radix"]),
             RADIX=TUNE["search_radix"],
             SORT=bp_sel <= TUNE["sort_max_blocks"],
+            CARRY=carry,
             num_warps=_warps(TUNE["final_warps"], bp_sel),
         )
     else:
@@ -2080,12 +2188,16 @@ def select_blocks_two_stage_ref(
     return_cand=False,
     region=0,
     region_alpha=0.5,
+    carry_score=None,
+    carry_threshold=0.0,
 ):
     """Readable torch reference of select_blocks_two_stage (same block sets), for tests.
 
     region / region_alpha: the shared prefilter's per-region quotas (TUNE prefilter_region
-    and prefilter_region_alpha); 0 is the global top.
+    and prefilter_region_alpha); 0 is the global top. carry_score / carry_threshold: as
+    the kernel (needs region quotas); carry_score is updated in place.
     """
+    assert carry_score is None or (prefilter_shared and region)
     B, Hq, D = q.shape
     Hkv, P = kmin.shape[1], kmin.shape[2]
     G = Hq // Hkv
@@ -2117,16 +2229,23 @@ def select_blocks_two_stage_ref(
             lshared = torch.logsumexp(torch.log_softmax(ranked, -1), 2).masked_fill(
                 ~free, float("-inf")
             )
-            top = _region_top_ref(
-                shared,
-                lshared,
-                cur_p,
-                n_keep,
-                region,
-                region_alpha,
-                sink_blocks,
-                local_blocks,
-            )
+            # carried blocks outrank the rest of their region
+            if carry_score is not None:
+                carried = free & (carry_score[:, None, :] >= carry_threshold)
+                lshared = lshared.masked_fill(carried, float("inf"))
+            if prefilter_fraction >= 1.0:  # a full scan keeps every free block
+                top = free.expand_as(shared)
+            else:
+                top = _region_top_ref(
+                    shared,
+                    lshared,
+                    cur_p,
+                    n_keep,
+                    region,
+                    region_alpha,
+                    sink_blocks,
+                    local_blocks,
+                )
         else:
             top = torch.zeros_like(shared, dtype=torch.bool).scatter(
                 -1, shared.topk(n_keep, dim=-1).indices, True
@@ -2148,9 +2267,11 @@ def select_blocks_two_stage_ref(
     tok_logits = torch.nn.functional.pad(tok_logits, (0, pad), value=float("-inf"))
     mass = torch.logsumexp(tok_logits.view(B, Hkv, G, cur_p, block_size), -1)
     mass = torch.nn.functional.pad(mass, (0, P - cur_p), value=float("-inf"))
-    probs = torch.softmax(mass.masked_fill(~cand.unsqueeze(2), float("-inf")), -1).mean(
-        2
-    )  # [B, Hkv, P]
+    head_probs = torch.softmax(mass.masked_fill(~cand.unsqueeze(2), float("-inf")), -1)
+    probs = head_probs.mean(2)  # [B, Hkv, P]
+    if carry_score is not None:
+        found = torch.where(cand & free, head_probs.amax(2), 0.0).amax(1)  # [B, P]
+        carry_score.copy_(torch.maximum(carry_score, found))
     cap = min(
         P, min(P, sink_blocks + local_blocks) + max(1, math.ceil(max_fraction * P))
     )
@@ -2210,7 +2331,8 @@ def _region_top_ref(shared, lshared, cur_p, n_keep, region, alpha, sink, local):
     top = torch.zeros_like(shared, dtype=torch.bool)
     for r, lo in enumerate(starts):
         part = lshared[..., lo : min(lo + region, cur_p)]
-        rank = part.argsort(-1, descending=True).argsort(-1)
+        # stable: blocks tied in rank are taken in block order, as the kernel does
+        rank = part.argsort(dim=-1, descending=True, stable=True).argsort(-1)
         top[..., lo : lo + part.shape[-1]] = rank < k[..., r : r + 1]
     return top
 
