@@ -7,9 +7,11 @@ model's own forward on a static cache, the first step eager and the rest CUDA-gr
 replays. "sparse" is TwoStageBlockSparse as the adapter registers it, with the given
 config overrides; dense modes are those of hf_graph_decode_bench (sdpa_gqa, dense_flash).
 
-Datasets: "ruler32k" (xAlg-AI/att-hub-ruler-32k) or "ruler128k" (the raw RULER-131072
-data Skylight's ruler128k benchmark loads, split by its prepare_dataframe). Only the
-parquet files of the requested subsets are downloaded. Every sample is appended to --out
+Datasets: "ruler32k" (xAlg-AI/att-hub-ruler-32k), "ruler128k" (the raw RULER-131072
+data Skylight's ruler128k benchmark loads, split by its prepare_dataframe) or "ruler256k"
+(SaylorTwift/RULER-262144-Qwen2.5-Base, the same format sized at 262,144 tokens; it needs
+a model with that window and about two contexts of K/V on the GPU). Only the parquet
+files of the requested subsets are downloaded. Every sample is appended to --out
 as one JSON line (predictions and references), so an interrupted run keeps its samples
 and a rerun with the same --out skips them; the summary at the end scores what is there.
 --start skips the first samples of each subset (samples 50-74: --n 75 --start 50).
@@ -34,6 +36,16 @@ from ruler_kernel_eval import SUBSETS, _prompt_ids, _score
 from benchmark.ruler128k.prepare_dataframe import prepare_dataframe
 from sparse_attention_hub.adapters import ModelAdapterHF
 
+# Subsets of the 262,144-token set that are stored in two parquet shards.
+_TWO_SHARDS_256K = (
+    "niah_multikey_1",
+    "niah_multiquery",
+    "niah_multivalue",
+    "niah_single_2",
+    "niah_single_3",
+    "qa_2",
+)
+
 
 def _rows(data: str, subset: str, n: int) -> pd.DataFrame:
     if data == "ruler32k":
@@ -41,12 +53,17 @@ def _rows(data: str, subset: str, n: int) -> pd.DataFrame:
 
         rows = load_dataset("xAlg-AI/att-hub-ruler-32k", subset, split=subset)
         return rows.select(range(n)).to_pandas()
+    repo, size, shards = "SaylorTwift/RULER-131072-llama-3.2-tokenizer", 131072, 1
+    if data == "ruler256k":
+        repo, size = "SaylorTwift/RULER-262144-Qwen2.5-Base", 262144
+        shards = 2 if subset in _TWO_SHARDS_256K else 1
     path = hf_hub_download(
-        "SaylorTwift/RULER-131072-llama-3.2-tokenizer",
-        f"data/{subset}-00000-of-00001.parquet",
-        repo_type="dataset",
+        repo, f"data/{subset}-00000-of-0000{shards}.parquet", repo_type="dataset"
     )
-    return prepare_dataframe(pd.read_parquet(path).head(n), subset, 131072)
+    rows = pd.read_parquet(path)
+    # Only the first shard is read, so it must hold all the samples asked for.
+    assert shards == 1 or n <= len(rows), (subset, n, len(rows))
+    return prepare_dataframe(rows.head(n), subset, size)
 
 
 def main(
