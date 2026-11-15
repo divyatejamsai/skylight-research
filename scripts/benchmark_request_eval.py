@@ -4,13 +4,15 @@ The benchmark is created by name from Skylight's registry and run with
 Benchmark.run_benchmark: its data, its prompts, its request loop and its metrics. This
 script only chooses the attention (TwoStageBlockSparse with the --sparse overrides, or
 none with --dense) and the options of the request loop: generation_kwargs["graph_decode"]
-(the static-cache decode path), and optionally max_requests (the first rows of the
+(the static-cache decode path) and, with --compile_layers, "compile_layers" (compiled
+decoder layers in that path), and optionally max_requests (the first rows of the
 dataset) and max_context_length (tokens of context kept).
 
 Besides the runner's own metrics.json and config.json, the rows are saved without their
-contexts in results.jsonl (one row per request, with the prediction and the reference),
-so that two runs can be compared prompt by prompt; the runner's raw_results.csv, which
-repeats every context, is removed unless --keep_raw.
+contexts in results.jsonl (one row per request, with the prediction, the reference and
+context_hash, the first 16 hex digits of the SHA-256 of the context), so that two runs can
+be compared prompt by prompt; the runner's raw_results.csv, which repeats every context,
+is removed unless --keep_raw.
 
 Example:
     python scripts/benchmark_request_eval.py --benchmark infinite_bench \
@@ -21,6 +23,7 @@ Example:
         --out results/infbench_passkey_dense
 """
 
+import hashlib
 import json
 import os
 import time
@@ -60,6 +63,7 @@ def main(
     max_requests: int = 0,
     max_context_length: int = 0,
     graph_decode: bool = True,
+    compile_layers: bool = False,
     keep_raw: bool = False,
     out: str = "results/benchmark_request",
 ) -> None:
@@ -78,6 +82,8 @@ def main(
     ensure_benchmarks_loaded()
     bench = create_benchmark_instance(benchmark, subset_list or None)
     generation_kwargs: Dict[str, Any] = {"graph_decode": graph_decode}
+    if compile_layers:
+        generation_kwargs["compile_layers"] = True
     if max_new_tokens:  # otherwise the benchmark's own limit for each row
         generation_kwargs["max_new_tokens"] = max_new_tokens
     request_kwargs: Dict[str, Any] = {}
@@ -100,7 +106,14 @@ def main(
     metrics = bench.run_benchmark(adapter, out, generation_kwargs, request_kwargs)
     minutes = (time.time() - t0) / 60
 
-    rows = scored["rows"].drop(columns=["context"], errors="ignore")
+    rows = scored["rows"]
+    if "context" in rows.columns:
+        rows = rows.assign(
+            context_hash=[
+                hashlib.sha256(str(context).encode("utf-8")).hexdigest()[:16]
+                for context in rows["context"]
+            ]
+        ).drop(columns=["context"])
     with open(f"{out}/results.jsonl", "w") as f:
         for record in rows.to_dict(orient="records"):
             f.write(json.dumps({k: _plain(v) for k, v in record.items()}) + "\n")

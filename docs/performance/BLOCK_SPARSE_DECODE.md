@@ -23,12 +23,16 @@ adapter = ModelAdapterHF(
 )
 response = adapter.process_request(
     Request(context=long_document, questions="...", answer_prefix=""),
-    generation_kwargs={"max_new_tokens": 256, "graph_decode": True},
+    generation_kwargs={
+        "max_new_tokens": 256,
+        "graph_decode": True,
+        "compile_layers": True,
+    },
     request_kwargs={},
 )
 ```
 
-Two settings matter for speed.
+Three settings matter for speed.
 
 - **`graph_decode: True`** in `generation_kwargs`. The default loop of
   `process_request` launches every kernel of every layer from Python at each token,
@@ -39,17 +43,27 @@ Two settings matter for speed.
   It is the same greedy decoding. It also works without sparse attention
   (`sparse_attention_config=None`), where the dense step runs as SDPA with native
   grouped-query attention.
+- **`compile_layers: True`** in `generation_kwargs`, with `graph_decode`. The decode
+  steps run through `torch.compile`'d decoder layers; the prefill, the questions and
+  the default loop do not. The layers are compiled once per model and process: at the
+  first request (11 to 39 s) and once more at the first request of another length (18
+  to 46 s). After that, requests of any length reuse the compiled code. It pays for a
+  benchmark or a long generation, not for one short request.
 - **`min_cached_tokens`**. Below about 32k cached tokens the selection costs more than
   it saves; with `min_cached_tokens=32768` such sequences decode densely.
 
-`graph_decode` goes through any benchmark unchanged:
+Both options go through any benchmark unchanged:
 
 ```python
 from benchmark.loft.loft_rag import LoftRag
 
 LoftRag(subsets_to_run=["nq_128k"]).run_benchmark(
     adapter, "results/loft_nq",
-    generation_kwargs={"max_new_tokens": 4096, "graph_decode": True},
+    generation_kwargs={
+        "max_new_tokens": 4096,
+        "graph_decode": True,
+        "compile_layers": True,
+    },
 )
 ```
 
@@ -112,9 +126,11 @@ their end tokens from `static_decode.end_token_ids`.
 
 ### Through `process_request`
 
-One request of 131,025 prompt tokens and 512 new tokens, `carry_threshold=0.2`, decoder
-layers not compiled (`scripts/hf_request_bench.py`). The `graph_decode` rows are four
-fresh processes on a GPU with no other process.
+One request of 131,025 prompt tokens and 512 new tokens, `carry_threshold=0.2`
+(`scripts/hf_request_bench.py`), Qwen3-4B. The `graph_decode` rows are four fresh
+processes on a GPU with no other process. The `compile_layers` rows are four more,
+each with three requests per mode at three context lengths: the first request, and the
+third as the steady state of a process.
 
 | | Dense | Sparse | Sparse / dense |
 |---|---|---|---|
@@ -124,12 +140,20 @@ fresh processes on a GPU with no other process.
 | **`graph_decode`, ms per token** | 10.98 | 8.59 | **1.28×** (± 0.02) |
 | `graph_decode`, decode start to first replay | 0.4 to 0.8 s | 0.7 s | |
 | `graph_decode`, peak memory | 35.3 GiB | 35.3 GiB | |
+| **`graph_decode` + `compile_layers`, ms per token**, first request | 7.44 | 5.05 | **1.47×** (± 0.01) |
+| `graph_decode` + `compile_layers`, ms per token, steady state | 7.54 | 5.10 | **1.48×** |
+| `graph_decode` + `compile_layers`, decode start to first replay, requests 1 / 2 / 3 | 14 to 39 / 22 to 24 / 0.4 s | 16 to 23 / 42 to 46 / 0.3 s | |
 
-- With `graph_decode` the sparse step is 1.28× the dense one. It is 1.45× with compiled
-  layers; `process_request` does not compile them. Sparse attention saves the same 2.4 ms
-  per token in both.
+- With `graph_decode` alone the sparse step is 1.28× the dense one, and with
+  `compile_layers` 1.47× (1.50× on Phi-4-mini at 129k; 1.48× and 1.47× in the steady
+  state). Sparse attention saves about 2.4 ms per token in both; compiled layers shorten
+  the rest of the step. Both figures were measured against a bar written down before
+  the run (1.20, and within 0.03 of the timing harness).
 - Against the default loop, `graph_decode` is 2.1× faster per token for dense and 3.9×
-  for sparse.
+  for sparse; with `compile_layers` 3.2× and 6.6×.
+- One prefill per request: LOFT nq (110 questions of one context) through
+  `LoftRag.run_benchmark` takes 1.5 minutes for dense and 2.2 for sparse, against 40
+  with a prefill per question, with the same scores.
 - `graph_decode` asks the prefill for one position of logits; the default loop keeps all
   of them, which is the difference in peak memory.
 - LOFT nq at 128k through `LoftRag.run_benchmark` with `graph_decode`
@@ -190,6 +214,10 @@ place.
 - The 8-bit key copy adds 25% to the key-value cache, plus the per-block statistics.
 - `graph_decode` does not support hybrid models, and needs dense attention or a sparse
   attention that sets `supports_static_cache_decode`. It refuses before the prefill.
+- `compile_layers` needs `graph_decode`, the model on a GPU, PyTorch 2.6 or later
+  (`torch.compiler.set_stance`) and a model with its decoder layers in
+  `model.model.layers`. It also refuses before the prefill.
+- Tested with transformers 4.57 and 5.23 (the static cache changed between them).
 - Phi models are supported. Their LongRoPE picks its frequencies on the host at every
   call; the graphed steps keep the choice of the first step, and a decode that would
   cross the 4,096-token boundary between the two sets runs without a graph. Their
@@ -203,13 +231,16 @@ place.
 # speed (one dense and one sparse run per fresh process)
 python scripts/hf_graph_decode_bench.py --ctx 131072 --batch 1 --compile \
     --modes sdpa_gqa,sparse --sparse "carry_threshold=0.2"
-# speed through process_request
+# speed through process_request, and with compiled layers over three requests
 python scripts/hf_request_bench.py --ctx 131072 --sparse "carry_threshold=0.2"
+python scripts/hf_request_bench.py --ctx 131072 --sparse "carry_threshold=0.2" \
+    --compile_layers True --rounds 3 --round_step 500
 # quality: dense, carried set and default from one prefill per prompt
 python scripts/hf_ruler_multi_eval.py --data ruler128k --subsets niah_multikey_3,qa_1 \
     --ranges 0..24 --sparse "carry_threshold=0.2" --variants "/carry_threshold=0.0"
 # a benchmark through Skylight's runner
-python scripts/loft_request_eval.py --subsets nq_128k --sparse "carry_threshold=0.2"
+python scripts/benchmark_request_eval.py --benchmark loft_rag --subsets nq_128k \
+    --max_new_tokens 4096 --sparse "carry_threshold=0.2" --compile_layers True
 # tests (the kernel tests need a GPU)
 pytest tests/unit/sparse_attention/efficient_attention/test_two_stage_block_sparse.py \
     tests/unit/adapters/test_graph_decode.py
