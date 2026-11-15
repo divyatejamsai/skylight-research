@@ -34,17 +34,15 @@ import contextlib
 import gc
 import json
 import statistics
-import time
 from typing import Dict, List, Optional
 
 import fire
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
-from transformers import AttentionInterface, StaticCache
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers import AttentionInterface
 
-from sparse_attention_hub.adapters import ModelAdapterHF
+from sparse_attention_hub.adapters import ModelAdapterHF, static_decode
 from sparse_attention_hub.kernels.block_sparse_decode import block_sparse_decode_fused
 from sparse_attention_hub.sparse_attention import TwoStageBlockSparseConfig
 
@@ -94,41 +92,10 @@ AttentionInterface.register("dense_flash", dense_flash)
 AttentionInterface.register("no_attention", no_attention)
 
 
-def _compile_layers(model) -> None:
-    """torch.compile every decoder layer (fused norms/RoPE/SiLU/residuals), with the
-    settings scripts/e2e_decode_bench.py uses for its layer halves."""
-    torch._dynamo.config.cache_size_limit = 256  # layer_idx specializes per layer
-    torch._dynamo.config.accumulated_cache_size_limit = 4096
-    for layer in model.model.layers:
-        layer.compile(mode="max-autotune-no-cudagraphs", dynamic=False)
-
-
-def _opaque_attention() -> None:
-    """Keep every registered attention function out of the compiled graphs (a graph
-    break), so the compiled layers run around it as the e2e loop's layer halves do."""
-    mapping = ALL_ATTENTION_FUNCTIONS._global_mapping
-    for name, fn in mapping.items():
-        if not getattr(fn, "_opaque", False):
-            mapping[name] = torch.compiler.disable(fn)
-            mapping[name]._opaque = True
-
-
-@contextlib.contextmanager
-def _attention(model, name: str):
-    """Switch every module's attention implementation, as ModelAdapterHF does."""
-    mods = [
-        mod
-        for mod in model.modules()
-        if hasattr(getattr(mod, "config", None), "_attn_implementation")
-    ]
-    old = [mod.config._attn_implementation for mod in mods]
-    for mod in mods:
-        mod.config._attn_implementation = name
-    try:
-        yield
-    finally:
-        for mod, impl in zip(mods, old):
-            mod.config._attn_implementation = impl
+# The pieces of the decode that every script shares live in the library.
+_compile_layers = static_decode.compile_decoder_layers
+_opaque_attention = static_decode.keep_attention_out_of_compiled_graphs
+_attention = static_decode.attention_implementation
 
 
 def _config(overrides: str) -> TwoStageBlockSparseConfig:
@@ -152,63 +119,38 @@ def _config(overrides: str) -> TwoStageBlockSparseConfig:
 def _decode(adapter, pre, first, ctx, batch, new_tokens, mode: str):
     """Eager first step, then graph replays. Returns (first-step logits row 0, tokens, s)."""
     m = adapter.model
-    cfg = m.config
-    hkv = cfg.num_key_value_heads
-    hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
-    cache = StaticCache(config=cfg, max_cache_len=ctx + new_tokens + 8)
-    cache.early_initialization(batch, hkv, hd, m.dtype, m.device)
-    # src may wait on the CPU (pre_on_cpu)
-    for dst, src in zip(cache.layers, pre.layers):
-        dst.keys[:, :, :ctx] = src.keys[:1, :, :ctx].to(dst.keys.device)
-        dst.values[:, :, :ctx] = src.values[:1, :, :ctx].to(dst.values.device)
-    tok = (
-        first.view(1, 1).expand(batch, 1).clone()
-    )  # not a view of first: steps write it
-    pos = torch.full((1,), ctx, device=m.device, dtype=torch.long)
-    # A 4D mask is used as given; HF's eager_mask (registered for the custom attention)
-    # copies a host scalar, which CUDA-graph capture forbids. Every mode gets this one.
-    slots = torch.arange(cache.max_cache_len, device=m.device)
-    mask = torch.zeros(batch, 1, 1, slots.numel(), device=m.device, dtype=torch.bool)
-    kw = dict(
-        input_ids=tok,
-        attention_mask=mask,
-        position_ids=pos.view(1, 1).expand(batch, 1),
-        cache_position=pos,
-        past_key_values=cache,
-        use_cache=True,
-        logits_to_keep=1,
+    # src may wait on the CPU (pre_on_cpu); it is kept for the next mode
+    cache = static_decode.move_to_static_cache(
+        m.config,
+        pre,
+        ctx,
+        new_tokens + 8,
+        batch=batch,
+        device=m.device,
+        keep_source=True,
     )
     if mode == "sparse":
-        kw["sparse_meta_data"] = {}
-        attention = adapter.enable_sparse_mode()
+        attention, meta = adapter.enable_sparse_mode(), {}
     elif mode == "hf_sdpa":
-        attention = contextlib.nullcontext()
+        attention, meta = contextlib.nullcontext(), None
     else:
-        attention = _attention(m, mode)
-
-    def step():
-        mask.copy_((slots <= pos).expand_as(mask))
-        logits = m(**kw).logits[:, -1].float()
-        tok.copy_(logits.argmax(-1, keepdim=True))
-        pos.add_(1)
-        return logits
-
-    with attention:
-        _opaque_attention()  # the adapter registers its function on enable_sparse_mode
-        first_logits = step()[0].clone()  # eager: compiles kernels, builds metadata
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            step()
-        toks = []
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(new_tokens):
-            graph.replay()
-            toks.append(tok.clone())
-        torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
-    del graph, cache
-    return first_logits, torch.cat(toks, dim=1), dt
+        attention, meta = _attention(m, mode), None
+    # One eager step (it compiles kernels and builds the sparse metadata), then
+    # new_tokens replays, which are what is timed.
+    out = static_decode.decode_on_static_cache(
+        m,
+        cache,
+        first,
+        ctx,
+        new_tokens + 1,
+        attention=attention,
+        sparse_meta_data=meta,
+        batch=batch,
+        opaque_attention=True,  # the adapter registers its function on enable
+    )
+    assert out.used_graph and out.steps == new_tokens + 1
+    del cache
+    return out.first_logits, out.tokens[:, 1:], out.replay_seconds
 
 
 def main(

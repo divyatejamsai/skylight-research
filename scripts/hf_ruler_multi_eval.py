@@ -33,25 +33,17 @@ import os
 
 import fire
 import torch
-from hf_graph_decode_bench import _attention, _config, _opaque_attention
+from hf_graph_decode_bench import _attention, _config
 from hf_ruler_eval import _rows
 from ruler_kernel_eval import _prompt_ids, _score
-from transformers import StaticCache
 
-from sparse_attention_hub.adapters import ModelAdapterHF
+from sparse_attention_hub.adapters import ModelAdapterHF, static_decode
 
 
 def _static_from(cfg, pkv, ctx, room):
     """A StaticCache of ctx + room tokens holding the prefill cache pkv, which is emptied
     layer by layer as it is copied, so the peak is one cache and not two."""
-    cache = StaticCache(config=cfg, max_cache_len=ctx + room)
-    for dst, src in zip(cache.layers, pkv.layers):
-        dst.lazy_initialization(src.keys[:1, :, :0])
-        dst.keys[:, :, :ctx] = src.keys[:1, :, :ctx]
-        dst.values[:, :, :ctx] = src.values[:1, :, :ctx]
-        src.keys = src.values = None
-        torch.cuda.empty_cache()  # the freed layer is a little too small to be reused
-    return cache
+    return static_decode.move_to_static_cache(cfg, pkv, ctx, room)
 
 
 @torch.no_grad()
@@ -60,45 +52,22 @@ def _decode(adapter, cache, first, ctx, batch, new_tokens, mode):
     prefill. Returns (first-step logits row 0, tokens, None)."""
     assert batch == 1 and cache.max_cache_len >= ctx + new_tokens + 8
     m = adapter.model
-    tok = first.view(1, 1).clone()  # not a view of first: steps write it
-    pos = torch.full((1,), ctx, device=m.device, dtype=torch.long)
-    slots = torch.arange(cache.max_cache_len, device=m.device)
-    mask = torch.zeros(1, 1, 1, slots.numel(), device=m.device, dtype=torch.bool)
-    kw = dict(
-        input_ids=tok,
-        attention_mask=mask,
-        position_ids=pos.view(1, 1),
-        cache_position=pos,
-        past_key_values=cache,
-        use_cache=True,
-        logits_to_keep=1,
-    )
     if mode == "sparse":
-        kw["sparse_meta_data"] = {}
-        attention = adapter.enable_sparse_mode()
+        attention, meta = adapter.enable_sparse_mode(), {}
     else:
-        attention = _attention(m, mode)
-
-    def step():
-        mask.copy_((slots <= pos).expand_as(mask))
-        logits = m(**kw).logits[:, -1].float()
-        tok.copy_(logits.argmax(-1, keepdim=True))
-        pos.add_(1)
-        return logits
-
-    with attention:
-        _opaque_attention()  # the adapter registers its function on enable_sparse_mode
-        first_logits = step()[0].clone()  # eager: compiles kernels, builds metadata
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            step()
-        toks = []
-        for _ in range(new_tokens):
-            graph.replay()
-            toks.append(tok.clone())
-        torch.cuda.synchronize()
-    del graph
-    return first_logits, torch.cat(toks, dim=1), None
+        attention, meta = _attention(m, mode), None
+    out = static_decode.decode_on_static_cache(
+        m,
+        cache,
+        first,
+        ctx,
+        new_tokens + 1,
+        attention=attention,
+        sparse_meta_data=meta,
+        opaque_attention=True,  # the adapter registers its function on enable
+    )
+    assert out.used_graph
+    return out.first_logits, out.tokens[:, 1:], None
 
 
 def main(
@@ -140,7 +109,7 @@ def main(
     )
     assert adapter.sparse_attention.config is cfg  # the object the decode reads
     m, tok = adapter.model.eval(), adapter.tokenizer
-    eos = {tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>")}
+    eos = set(static_decode.end_token_ids(m, tok))  # the model's own end tokens
     spans = [tuple(int(x) for x in r.split("..")) for r in str(ranges).split("+")]
     n = max(hi for _, hi in spans) + 1
     done = set()

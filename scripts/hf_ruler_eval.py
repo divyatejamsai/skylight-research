@@ -34,7 +34,7 @@ from huggingface_hub import hf_hub_download
 from ruler_kernel_eval import SUBSETS, _prompt_ids, _score
 
 from benchmark.ruler128k.prepare_dataframe import prepare_dataframe
-from sparse_attention_hub.adapters import ModelAdapterHF
+from sparse_attention_hub.adapters import ModelAdapterHF, static_decode
 
 # Subsets of the 262,144-token set that are stored in two parquet shards.
 _TWO_SHARDS_256K = (
@@ -84,7 +84,7 @@ def main(
         device="cuda",
     )
     m, tok = adapter.model.eval(), adapter.tokenizer
-    eos = {tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>")}
+    eos = set(static_decode.end_token_ids(m, tok))  # the model's own end tokens
     mode_list = modes.split(",") if isinstance(modes, str) else list(modes)
     subset_list = subsets.split(",") if isinstance(subsets, str) else list(subsets)
     done = set()

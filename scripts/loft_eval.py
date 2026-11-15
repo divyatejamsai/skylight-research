@@ -19,6 +19,7 @@ import torch
 from huggingface_hub import hf_hub_download
 
 from benchmark.loft.calculate_metrics import calculate_metrics
+from sparse_attention_hub.adapters import static_decode
 
 # 4096 by the registered rule: on the dev split 4 of 50 dense outputs (8%, above the 2%
 # limit) reached the first cap of 1024. The dev pilot itself ran with 1024.
@@ -60,62 +61,32 @@ def score_loft(subset: str, preds, refs) -> float:
 
 @torch.no_grad()
 def decode_stop(adapter, cache, first, ctx, batch, new_tokens, mode):
-    """hf_ruler_multi_eval._decode with one change: the replay loop ends at the first
-    multiple of CHUNK steps after an end token."""
+    """hf_ruler_multi_eval._decode with one change: the decode ends at the first look
+    for an end token that finds one (a look every CHUNK steps)."""
     assert batch == 1 and cache.max_cache_len >= ctx + new_tokens + 8
     m, t = adapter.model, adapter.tokenizer
-    stop = torch.tensor(
-        [t.eos_token_id, t.convert_tokens_to_ids("<|im_end|>")], device=m.device
-    )
-    tok = first.view(1, 1).clone()
-    pos = torch.full((1,), ctx, device=m.device, dtype=torch.long)
-    slots = torch.arange(cache.max_cache_len, device=m.device)
-    mask = torch.zeros(1, 1, 1, slots.numel(), device=m.device, dtype=torch.bool)
-    kw = dict(
-        input_ids=tok,
-        attention_mask=mask,
-        position_ids=pos.view(1, 1),
-        cache_position=pos,
-        past_key_values=cache,
-        use_cache=True,
-        logits_to_keep=1,
-    )
+    stop = static_decode.end_token_ids(m, t)
     if mode == "sparse":
-        kw["sparse_meta_data"] = {}
-        attention = adapter.enable_sparse_mode()
+        attention, meta = adapter.enable_sparse_mode(), {}
     else:
-        attention = M._attention(m, mode)
-
-    def step():
-        mask.copy_((slots <= pos).expand_as(mask))
-        logits = m(**kw).logits[:, -1].float()
-        tok.copy_(logits.argmax(-1, keepdim=True))
-        pos.add_(1)
-        return logits
-
-    with attention:
-        M._opaque_attention()
-        first_logits = step()[0].clone()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            step()
-        head = torch.stack([first.view(()), first_logits.argmax()])
-        ended = bool(torch.isin(head, stop).any())
-        toks = []
-        for i in range(new_tokens):
-            graph.replay()
-            toks.append(tok.clone())
-            if ended:
-                break
-            if (i + 1) % CHUNK == 0:
-                ended = bool(torch.isin(torch.cat(toks[-CHUNK:], dim=1), stop).any())
-        if not ended:  # the steps after the last check
-            ended = bool(torch.isin(torch.cat(toks, dim=1), stop).any())
-        torch.cuda.synchronize()
-    del graph
+        attention, meta = M._attention(m, mode), None
+    out = static_decode.decode_on_static_cache(
+        m,
+        cache,
+        first,
+        ctx,
+        # An answer that the prefill's own token ends needs no more than the first step.
+        2 if int(first) in stop else new_tokens + 1,
+        attention=attention,
+        sparse_meta_data=meta,
+        stop_token_ids=stop,
+        stop_check_every=CHUNK,
+        opaque_attention=True,
+    )
+    ended = out.stopped or int(first) in stop
     # steps: replays run; capped: no end token within the cap
-    print("  steps", mode, len(toks), "capped" if not ended else "", flush=True)
-    return first_logits, torch.cat(toks, dim=1), None
+    print("  steps", mode, out.steps - 1, "capped" if not ended else "", flush=True)
+    return out.first_logits, out.tokens[:, 1:], None
 
 
 if __name__ == "__main__":

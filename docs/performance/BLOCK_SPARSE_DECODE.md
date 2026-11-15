@@ -32,11 +32,13 @@ Two settings matter for speed.
 
 - **`graph_decode: True`** in `generation_kwargs`. The default loop of
   `process_request` launches every kernel of every layer from Python at each token,
-  which costs more than the attention this method saves. With `graph_decode` the tokens
-  after the first are generated on a preallocated cache (`StaticCache`) with the decode
-  step captured once in a CUDA graph and replayed. It is the same greedy decoding. It
-  also works without sparse attention (`sparse_attention_config=None`), where the dense
-  step runs as SDPA with native grouped-query attention.
+  which costs more than the attention this method saves, and it prefills the context
+  again for every question. With `graph_decode` the context is prefilled once per
+  request and moved into a preallocated cache (`StaticCache`); each question is added
+  to it and answered there, with the decode step captured in a CUDA graph and replayed.
+  It is the same greedy decoding. It also works without sparse attention
+  (`sparse_attention_config=None`), where the dense step runs as SDPA with native
+  grouped-query attention.
 - **`min_cached_tokens`**. Below about 32k cached tokens the selection costs more than
   it saves; with `min_cached_tokens=32768` such sequences decode densely.
 
@@ -89,6 +91,23 @@ At 128k the default loses the answer on RULER's `niah_multikey_3` (thousands of
 near-identical lines): stage 1 ranks the right block too low in a few layers. The
 carried set repairs most of it at no measurable cost in speed. Four points remain on
 that subset.
+
+### A second model family
+
+`microsoft/Phi-4-mini-instruct` (24 query heads on 8 key-value heads), with the settings
+above unchanged and nothing tuned on it. The speed was predicted (1.30× to 1.55×) and
+written down before the run.
+
+| | Qwen3-4B | Phi-4-mini |
+|---|---|---|
+| Speedup, one sequence of about 129k cached tokens, `carry_threshold=0.2` | 1.45× | 1.50× |
+| RULER-128k, 250 prompts, `carry_threshold=0.2` − dense | −0.2 [−1.9, +1.4] | being rerun |
+
+The first RULER-128k run on Phi-4-mini is not quoted. Its decodes did not stop at the
+model's end-of-turn token (`<|end|>`, which is in the model's generation config and
+not the tokenizer's eos), so every mode was scored on text that ran past the answer.
+The evaluation scripts now take their end tokens from `static_decode.end_token_ids`,
+and the run is being repeated.
 
 ### Through `process_request`
 
@@ -154,6 +173,13 @@ The carried set is one score per block shared by the whole model: a layer raises
 the largest attention probability any head gave the block, and stage 1 of every layer
 treats a block at or above `carry_threshold` as a candidate.
 
+The decode itself is `sparse_attention_hub/adapters/static_decode.py`:
+`decode_on_static_cache` runs one eager step, records it in a CUDA graph and replays it,
+for any attention. `process_request`, the timing scripts and the evaluation scripts all
+call it, so what a graph capture needs (a 4D mask, the model's device and stream,
+LongRoPE, cache layers that never slide, the model's own end tokens) is handled in one
+place.
+
 ## Requirements and limits
 
 - CUDA and Triton (installed with PyTorch on Linux). On CPU the attention is dense.
@@ -161,9 +187,14 @@ treats a block at or above `carry_threshold` as a candidate.
 - Models with an attention sink input (`s_aux`) are not supported.
 - A head dimension of at least 16 (smaller models raise `NotImplementedError`).
 - The 8-bit key copy adds 25% to the key-value cache, plus the per-block statistics.
-- `graph_decode` does not support hybrid models or models with sliding-window cache
-  layers, and needs dense attention or a sparse attention that sets
-  `supports_static_cache_decode`. It refuses before the prefill.
+- `graph_decode` does not support hybrid models, and needs dense attention or a sparse
+  attention that sets `supports_static_cache_decode`. It refuses before the prefill.
+- Phi models are supported. Their LongRoPE picks its frequencies on the host at every
+  call; the graphed steps keep the choice of the first step, and a decode that would
+  cross the 4,096-token boundary between the two sets runs without a graph. Their
+  configs name a sliding window longer than any sequence, which is treated as no
+  window. A model whose window is shorter than the sequence is refused, and a model
+  with dynamic RoPE decodes without a graph.
 
 ## Reproduce and test
 

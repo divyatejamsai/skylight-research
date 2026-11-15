@@ -53,14 +53,15 @@ import torch
 from datasets import load_dataset
 from hf_graph_decode_bench import _config
 
-import sparse_attention_hub.adapters.huggingface as hf_adapter
-from sparse_attention_hub.adapters import ModelAdapterHF, Request
+from sparse_attention_hub.adapters import ModelAdapterHF, Request, static_decode
 
 QUESTION = "\n\nContinue the text above in the same style."
 
 
 class _Clock:
-    """Wall-clock marks around the adapter's decode: entry, first replay, exit."""
+    """Wall-clock marks around the adapter's work on a request: the prefill (with the
+    move into the static cache), the answer, the engine's decode and its first replay.
+    """
 
     def __init__(self) -> None:
         self.marks: Dict[str, float] = {}
@@ -74,29 +75,36 @@ class _Clock:
     def reset(self) -> None:
         self.marks, self.replays = {}, 0
 
-    def install(self, adapter: ModelAdapterHF) -> None:
+    def _timed(self, fn: Any, name: str) -> Any:
         clock = self
-        decode = adapter._decode_on_static_cache
-        generate = adapter._generate_response
 
-        def timed_decode(*args: Any, **kwargs: Any) -> Any:
-            clock.marks["decode_in"] = clock.now()
-            out = decode(*args, **kwargs)
-            clock.marks["decode_out"] = clock.now()
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            clock.marks[name + "_in"] = clock.now()
+            out = fn(*args, **kwargs)
+            clock.marks[name + "_out"] = clock.now()
             return out
 
-        def timed_generate(*args: Any, **kwargs: Any) -> Any:
-            clock.marks["generate_in"] = clock.now()
-            out = generate(*args, **kwargs)
-            clock.marks["generate_out"] = clock.now()
-            return out
+        return timed
 
-        adapter._decode_on_static_cache = timed_decode  # type: ignore[method-assign]
-        adapter._generate_response = timed_generate  # type: ignore[method-assign]
+    def install(self, adapter: ModelAdapterHF) -> None:
+        # graph_decode: the prefill and the answer are two methods of the adapter.
+        adapter._prefill_static_cache = self._timed(  # type: ignore[method-assign]
+            adapter._prefill_static_cache, "prefill"
+        )
+        adapter._answer_on_static_cache = self._timed(  # type: ignore[method-assign]
+            adapter._answer_on_static_cache, "generate"
+        )
+        # The default loop: the prefill is inside process_request, before this.
+        adapter._generate_response = self._timed(  # type: ignore[method-assign]
+            adapter._generate_response, "generate"
+        )
 
 
-def _time_replays(clock: _Clock) -> None:
-    """Count CUDAGraph replays and mark the first one."""
+def _time_decode(clock: _Clock) -> None:
+    """Mark the engine's decode, count its CUDAGraph replays and mark the first one."""
+    static_decode.decode_on_static_cache = clock._timed(
+        static_decode.decode_on_static_cache, "decode"
+    )
     replay = torch.cuda.CUDAGraph.replay
 
     def timed_replay(graph: torch.cuda.CUDAGraph) -> None:
@@ -138,6 +146,9 @@ def _run(
     )
     if graph:
         res["replays"] = clock.replays
+        # The context forward and the move into the static cache, without the chat
+        # template and the tokenising that prefill_s also covers.
+        res["prefill_forward_s"] = m["prefill_out"] - m["prefill_in"]
         res["setup_s"] = m["first_replay"] - m["decode_in"]
         res["replay_s"] = m["decode_out"] - m["first_replay"]
         res["ms_per_token"] = 1000 * res["replay_s"] / clock.replays
@@ -189,7 +200,7 @@ def main(
     )
     n_question = len(tokenizer.encode(questions[0], add_special_tokens=False))
     clock = _Clock()
-    _time_replays(clock)
+    _time_decode(clock)
     for adapter in adapters.values():
         clock.install(adapter)
 
@@ -237,14 +248,14 @@ def main(
         replayed = adapter.process_request(
             request, kwargs, {"max_context_length": ctx}
         ).responses
-        available = hf_adapter._graph_available
-        hf_adapter._graph_available = lambda device: False
+        available = static_decode.graph_available
+        static_decode.graph_available = lambda device: False
         try:
             stepped = adapter.process_request(
                 request, kwargs, {"max_context_length": ctx}
             ).responses
         finally:
-            hf_adapter._graph_available = available
+            static_decode.graph_available = available
         results["check_sparse_replay_equals_eager_steps"] = dict(
             equal=replayed == stepped, tokens=short_tokens
         )

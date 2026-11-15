@@ -11,10 +11,16 @@ from unittest.mock import patch
 import pytest
 import torch
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM
+from transformers import (
+    Phi3Config,
+    Phi3ForCausalLM,
+    PreTrainedTokenizerFast,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+)
 
 import sparse_attention_hub.adapters.huggingface as hf_adapter
-from sparse_attention_hub.adapters import ModelAdapterHF, Request
+from sparse_attention_hub.adapters import ModelAdapterHF, Request, static_decode
 from sparse_attention_hub.sparse_attention import (
     LocalMaskerConfig,
     ResearchAttentionConfig,
@@ -50,6 +56,42 @@ def _model(
         initializer_range=0.5,  # varied greedy tokens from random weights
     )
     model = Qwen2ForCausalLM(config).to(device=device, dtype=dtype).eval()
+    model.generation_config.eos_token_id = NO_STOP
+    return model
+
+
+def _longrope_model(
+    original_max: int,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float32,
+    sliding_window: int = 262144,
+) -> Phi3ForCausalLM:
+    """A two-layer Phi3 model as the Phi configs make it (head dimension 32): LongRoPE,
+    with one set of RoPE frequencies up to original_max tokens and another beyond,
+    chosen at every call, and a sliding window in the config that is longer than any
+    sequence, for which transformers builds sliding-window cache layers."""
+    torch.manual_seed(0)
+    config = Phi3Config(
+        vocab_size=VOCAB,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        max_position_embeddings=8192,
+        original_max_position_embeddings=original_max,
+        sliding_window=sliding_window,
+        rope_scaling={
+            "type": "longrope",
+            "short_factor": [1.0] * 16,
+            "long_factor": [1.0 + 0.25 * i for i in range(16)],
+        },
+        initializer_range=0.5,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    model = Phi3ForCausalLM(config).to(device=device, dtype=dtype).eval()
     model.generation_config.eos_token_id = NO_STOP
     return model
 
@@ -100,7 +142,7 @@ class TestGraphDecodeOnCPU:
         adapter = _adapter(_model())
         eager = _generate(adapter, _request(), max_new_tokens=24)
         with patch.object(
-            adapter, "_decode_on_static_cache", wraps=adapter._decode_on_static_cache
+            adapter, "_answer_on_static_cache", wraps=adapter._answer_on_static_cache
         ) as path:
             static = _generate(
                 adapter, _request(), max_new_tokens=24, graph_decode=True
@@ -160,6 +202,31 @@ class TestGraphDecodeOnCPU:
         assert isinstance(static, list) and len(static) == 2
         assert static == eager and static[0] != static[1]
 
+    def test_context_is_prefilled_once_for_all_questions(self) -> None:
+        model = _model()
+        adapter = _adapter(model)
+        # A long answer first: the second question starts on a cache that still holds
+        # the first question and its answer beyond the context.
+        questions = [_words(9, 3), _words(4, 2), _words(6, 5)]
+        request = Request(context=_words(40, 1), questions=questions, answer_prefix="")
+        kwargs: Dict[str, Any] = {"max_new_tokens": 20, "graph_decode": True}
+        with patch.object(
+            adapter, "_prefill_static_cache", wraps=adapter._prefill_static_cache
+        ) as prefill:
+            together = adapter.process_request(request, kwargs, {}).responses
+        prefill.assert_called_once()
+        alone = [
+            adapter.process_request(
+                Request(context=_words(40, 1), questions=q, answer_prefix=""),
+                kwargs,
+                {},
+            ).responses
+            for q in questions
+        ]
+        assert together == alone
+        eager = adapter.process_request(request, {"max_new_tokens": 20}, {}).responses
+        assert together == eager and len(set(together)) == 3
+
     def test_attention_implementation_is_restored(self) -> None:
         model = _model()
         adapter = _adapter(model)
@@ -169,11 +236,14 @@ class TestGraphDecodeOnCPU:
 
     def test_attention_implementation_is_restored_after_an_error(self) -> None:
         model = _model()
-        adapter = _adapter(model)
         before = model.config._attn_implementation
         with pytest.raises(RuntimeError, match="in the step"):
-            with adapter._attention_implementation("skylight_dense_decode"):
-                assert model.config._attn_implementation == "skylight_dense_decode"
+            with static_decode.attention_implementation(
+                model, static_decode.DENSE_ATTENTION
+            ):
+                assert (
+                    model.config._attn_implementation == static_decode.DENSE_ATTENTION
+                )
                 raise RuntimeError("in the step")
         assert model.config._attn_implementation == before
 
@@ -183,7 +253,7 @@ class TestGraphDecodeOnCPU:
         with torch.no_grad():
             pkv = adapter.model(ids, use_cache=True).past_key_values
         keys = [layer.keys.clone() for layer in pkv.layers]
-        cache = adapter._to_static_cache(pkv, 30, room=10)
+        cache = static_decode.move_to_static_cache(adapter.model.config, pkv, 30, 10)
         assert cache.max_cache_len == 40
         for layer, src, k in zip(cache.layers, pkv.layers, keys):
             assert src.keys is None and src.values is None
@@ -244,17 +314,67 @@ class TestGraphDecodeOnCPU:
             adapter, rows, {"max_new_tokens": 8}, {}
         )
         with patch.object(
-            adapter, "_decode_on_static_cache", wraps=adapter._decode_on_static_cache
-        ) as path:
+            adapter, "_answer_on_static_cache", wraps=adapter._answer_on_static_cache
+        ) as answer, patch.object(
+            adapter, "_prefill_static_cache", wraps=adapter._prefill_static_cache
+        ) as prefill:
             static = benchmark._process_all_requests(
                 adapter, rows, {"max_new_tokens": 8, "graph_decode": True}, {}
             )
-        assert path.call_count == len(rows) == 5
+        assert answer.call_count == len(rows) == 5
+        assert prefill.call_count == rows["context"].nunique()  # once per context
         assert list(static["predicted_answer"]) == list(eager["predicted_answer"])
+
+    def test_static_cache_layers_never_slide(self) -> None:
+        # A window longer than the cache never slides: plain layers, no token count.
+        cache = static_decode.static_cache(_longrope_model(100).config, 300)
+        assert all(type(layer).__name__ == "StaticLayer" for layer in cache.layers)
+        assert all(layer.max_cache_len == 300 for layer in cache.layers)
+        plain = static_decode.static_cache(_model().config, 300)
+        assert all(type(layer).__name__ == "StaticLayer" for layer in plain.layers)
+        # A window shorter than the cache would drop tokens: refused.
+        short = _longrope_model(100, sliding_window=64)
+        with pytest.raises(NotImplementedError, match="slides"):
+            static_decode.static_cache(short.config, 300)
+
+    def test_rope_blocks_graph(self) -> None:
+        # LongRoPE: a graph is possible while the frequencies stay the same.
+        model = _longrope_model(original_max=100)
+        assert not static_decode.rope_blocks_graph(model, 41, 90)
+        assert not static_decode.rope_blocks_graph(model, 101, 150)
+        assert static_decode.rope_blocks_graph(model, 90, 110)
+        assert not static_decode.rope_blocks_graph(_model(), 90, 110)  # plain RoPE
+
+    @pytest.mark.parametrize("n_tokens", [40, 300])
+    def test_frozen_rope_keeps_the_last_frequencies(self, n_tokens: int) -> None:
+        model = _longrope_model(original_max=100)
+        rope = model.model.rotary_emb
+        x = torch.zeros(1, 1, 256)
+        position_ids = torch.arange(n_tokens)[None]
+        cos, sin = rope(x, position_ids)  # chooses the frequencies for n_tokens
+        with static_decode.frozen_rope(model):
+            assert "forward" in rope.__dict__
+            frozen_cos, frozen_sin = rope(x, position_ids)
+        assert "forward" not in rope.__dict__
+        assert torch.equal(frozen_cos, cos) and torch.equal(frozen_sin, sin)
+        # The two sets of frequencies differ, so the freeze is not a no-op.
+        other = rope(x, torch.arange(340 - n_tokens)[None])[0]
+        assert not torch.equal(other[:, :40], cos[:, :40])
+
+    @pytest.mark.parametrize("original_max", [20, 60, 4096])
+    def test_longrope_model_same_text_as_the_eager_loop(
+        self, original_max: int
+    ) -> None:
+        # 46 prompt tokens, 24 new ones: above the limit, across it and below it.
+        adapter = _adapter(_longrope_model(original_max))
+        eager = _generate(adapter, _request(), max_new_tokens=24)
+        static = _generate(adapter, _request(), max_new_tokens=24, graph_decode=True)
+        assert len(set(_ids(eager))) > 4
+        assert static == eager
 
     def test_default_is_the_eager_loop(self) -> None:
         adapter = _adapter(_model())
-        with patch.object(adapter, "_decode_on_static_cache") as static:
+        with patch.object(adapter, "_answer_on_static_cache") as static:
             _generate(adapter, _request(), max_new_tokens=6)
             _generate(adapter, _request(), max_new_tokens=6, graph_decode=False)
         static.assert_not_called()
@@ -267,29 +387,40 @@ def _decode_tokens(
     stop: List[int],
     use_graph: bool,
 ) -> List[int]:
-    """_decode_on_static_cache after a dense prefill of ids, with or without the graph."""
+    """The engine's decode after a dense prefill of ids, with or without the graph."""
+    sparse = adapter._sparse_attention_available
+    n = ids.shape[1]
     with torch.no_grad():
         pre = adapter.model(ids, use_cache=True, logits_to_keep=1)
         first = pre.logits[0, -1].argmax()
+        cache = static_decode.move_to_static_cache(
+            adapter.model.config,
+            pre.past_key_values,
+            n,
+            max_steps + static_decode.CACHE_MARGIN,
+        )
 
-        def run() -> List[torch.Tensor]:
-            return adapter._decode_on_static_cache(
-                first, pre.past_key_values, max_steps, stop
-            )
+        def run() -> torch.Tensor:
+            return static_decode.decode_on_static_cache(
+                adapter.model,
+                cache,
+                first,
+                n,
+                max_steps,
+                attention=adapter.enable_sparse_mode() if sparse else None,
+                sparse_meta_data={} if sparse else None,
+                stop_token_ids=stop,
+            ).tokens[0]
 
-        if adapter._sparse_attention_available:
-            with adapter.enable_sparse_mode():
-                out = _with_graph(run, use_graph)
-        else:
-            out = _with_graph(run, use_graph)
+        out = _with_graph(run, use_graph)
     return [int(t) for t in out]
 
 
-def _with_graph(run: Any, use_graph: bool) -> List[torch.Tensor]:
+def _with_graph(run: Any, use_graph: bool) -> torch.Tensor:
     if use_graph:
         return run()
     # Without a graph the path runs every step eagerly.
-    with patch.object(hf_adapter, "_graph_available", lambda device: False):
+    with patch.object(static_decode, "graph_available", lambda device: False):
         return run()
 
 
@@ -338,7 +469,7 @@ class TestGraphDecodeOnCUDA:
         free = _decode_tokens(adapter, self._ids(), 40, [NO_STOP], use_graph=True)
         firsts = sorted({free.index(token) for token in free})
         assert len(firsts) >= 8  # several places to stop at
-        with patch.object(hf_adapter, "_STOP_CHECK_EVERY", every):
+        with patch.object(static_decode, "STOP_CHECK_EVERY", every):
             for hit in firsts:
                 got = _decode_tokens(
                     adapter, self._ids(), 40, [NO_STOP, free[hit]], use_graph=True
@@ -357,6 +488,36 @@ class TestGraphDecodeOnCUDA:
         assert torch.cuda.current_device() == 0
         assert len(graph) == 50 and len(set(graph)) > 4
         assert graph == eager
+
+    @pytest.mark.parametrize("sparse", [False, True])
+    def test_longrope_replay_matches_eager_steps(self, sparse: bool) -> None:
+        # LongRoPE chooses its frequencies on the host at every call: the graphed steps
+        # keep the choice of the eager first step.
+        dtype = torch.bfloat16 if sparse else torch.float32
+        model = _longrope_model(1024, "cuda", dtype)
+        config = TwoStageBlockSparseConfig(carry_threshold=0.2) if sparse else None
+        kwargs: Dict[str, Any] = dict(max_steps=50, stop=[NO_STOP])
+        graph = _decode_tokens(
+            _adapter(model, config), self._ids(), use_graph=True, **kwargs
+        )
+        eager = _decode_tokens(
+            _adapter(model, config), self._ids(), use_graph=False, **kwargs
+        )
+        assert len(graph) == 50 and len(set(graph)) > 4
+        assert graph == eager
+        assert "forward" not in model.model.rotary_emb.__dict__
+
+    def test_longrope_change_of_frequencies_is_not_graphed(self) -> None:
+        # 3000 cached tokens and 50 steps cross the limit of 3020: no graph.
+        model = _longrope_model(3020, "cuda", torch.float32)
+        adapter = _adapter(model)
+        with patch.object(torch.cuda, "CUDAGraph", wraps=torch.cuda.CUDAGraph) as graph:
+            crossing = _decode_tokens(adapter, self._ids(), 50, [NO_STOP], True)
+            graph.assert_not_called()
+            _decode_tokens(adapter, self._ids(), 10, [NO_STOP], True)  # stays below
+            graph.assert_called_once()
+        eager = _decode_tokens(adapter, self._ids(), 50, [NO_STOP], False)
+        assert len(crossing) == 50 and crossing == eager
 
     @pytest.mark.parametrize("sparse", [False, True])
     def test_same_text_as_the_eager_loop(self, sparse: bool) -> None:
@@ -389,6 +550,33 @@ class TestGraphDecodeOnCUDA:
         adapter = _adapter(model, TwoStageBlockSparseConfig())
         with pytest.raises(NotImplementedError, match="head dimension"):
             _decode_tokens(adapter, self._ids(), 4, [NO_STOP], use_graph=False)
+
+    @pytest.mark.parametrize("sparse", [False, True])
+    def test_context_is_prefilled_once_for_all_questions(self, sparse: bool) -> None:
+        # Several questions on one prefilled cache give the answers of one request each.
+        dtype = torch.bfloat16 if sparse else torch.float32
+        model = _model("cuda", dtype, self.KERNEL_HIDDEN)
+        config = TwoStageBlockSparseConfig(carry_threshold=0.2) if sparse else None
+        adapter = _adapter(model, config)
+        context = _words(self.N_CONTEXT, 1)
+        questions = [_words(70, 3), _words(5, 2), _words(20, 5)]
+        kwargs: Dict[str, Any] = {"max_new_tokens": 40, "graph_decode": True}
+        with patch.object(
+            adapter, "_prefill_static_cache", wraps=adapter._prefill_static_cache
+        ) as prefill:
+            together = adapter.process_request(
+                Request(context=context, questions=questions, answer_prefix=""),
+                kwargs,
+                {},
+            ).responses
+        prefill.assert_called_once()
+        alone = [
+            adapter.process_request(
+                Request(context=context, questions=q, answer_prefix=""), kwargs, {}
+            ).responses
+            for q in questions
+        ]
+        assert together == alone and len(set(together)) == 3
 
     def test_process_request_sparse(self) -> None:
         model = _model("cuda", torch.bfloat16, self.KERNEL_HIDDEN)
