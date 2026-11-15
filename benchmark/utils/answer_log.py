@@ -109,6 +109,8 @@ class LoggedAdapter:
         return len(self._answers)
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):  # its own fields, before __init__ has set them
+            raise AttributeError(name)
         return getattr(self._adapter, name)
 
     def process_request(

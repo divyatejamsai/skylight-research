@@ -1,5 +1,6 @@
 """Unit tests for benchmark/utils/answer_log.py: a benchmark run that can be continued."""
 
+import copy
 import json
 from pathlib import Path
 from typing import Any, Dict, List
@@ -152,6 +153,20 @@ class TestLoggedAdapter:
         assert adapter.model_name == "a-model"
         with pytest.raises(AttributeError):
             adapter.no_such_attribute
+        assert copy.copy(adapter).model_name == "a-model"
+
+    def test_answers_with_any_characters_survive_the_file(self, tmp_path: Path) -> None:
+        """Model output can hold line breaks, quotes and half of a surrogate pair."""
+        text: str = 'line one\nline "two" \u00e9 \U0001f600 \ud83d end'
+
+        class Odd(CountingAdapter):
+            def process_request(self, request: Any, *args: Any) -> RequestResponse:
+                return RequestResponse(responses=[text])
+
+        path = str(tmp_path / "answers.jsonl")
+        LoggedAdapter(Odd(), path, RUN).process_request(_request(), {}, {})
+        again = LoggedAdapter(CountingAdapter(), path, RUN)
+        assert again.process_request(_request(), {}, {}).responses == [text]
 
     def test_an_interrupted_benchmark_run_is_continued(self, tmp_path: Path) -> None:
         """The second run answers only what the first did not, with the same result."""
