@@ -11,8 +11,13 @@ dataset) and max_context_length (tokens of context kept).
 Besides the runner's own metrics.json and config.json, the rows are saved without their
 contexts in results.jsonl (one row per request, with the prediction, the reference and
 context_hash, the first 16 hex digits of the SHA-256 of the context), so that two runs can
-be compared prompt by prompt; the runner's raw_results.csv, which repeats every context,
-is removed unless --keep_raw.
+be compared prompt by prompt (scripts/benchmark_paired_stats.py); the runner's
+raw_results.csv, which repeats every context, is removed unless --keep_raw.
+
+A run can be interrupted. Every answer is appended to answers.jsonl in the output
+directory as it arrives (benchmark/utils/answer_log.py), and the same command run again
+answers only the requests that are not in it. A directory that already has summary.json
+is complete and is left alone.
 
 Example:
     python scripts/benchmark_request_eval.py --benchmark infinite_bench \
@@ -23,7 +28,6 @@ Example:
         --out results/infbench_passkey_dense
 """
 
-import hashlib
 import json
 import os
 import time
@@ -39,6 +43,7 @@ from benchmark.benchmark_registry import (
     create_benchmark_instance,
     ensure_benchmarks_loaded,
 )
+from benchmark.utils.answer_log import LoggedAdapter, context_hash
 from sparse_attention_hub.adapters import ModelAdapterHF
 
 
@@ -67,20 +72,15 @@ def main(
     keep_raw: bool = False,
     out: str = "results/benchmark_request",
 ) -> None:
+    if os.path.exists(f"{out}/summary.json"):
+        print(f"{out} is complete (it has summary.json), nothing to run")
+        return
     cfg = None if dense else _config(sparse)
-    adapter = ModelAdapterHF(
-        model,
-        cfg,
-        model_kwargs=dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa"),
-        device="cuda",
-    )
     subset_list: List[str] = (
         [s for s in subsets.split(",") if s]
         if isinstance(subsets, str)
         else list(subsets)
     )
-    ensure_benchmarks_loaded()
-    bench = create_benchmark_instance(benchmark, subset_list or None)
     generation_kwargs: Dict[str, Any] = {"graph_decode": graph_decode}
     if compile_layers:
         generation_kwargs["compile_layers"] = True
@@ -91,6 +91,30 @@ def main(
         request_kwargs["max_requests"] = max_requests
     if max_context_length:
         request_kwargs["max_context_length"] = max_context_length
+    run: Dict[str, Any] = dict(
+        benchmark=benchmark,
+        subsets=subset_list,
+        model=model,
+        attention="dense" if dense else vars(cfg),
+        generation_kwargs=generation_kwargs,
+        request_kwargs=request_kwargs,
+    )
+    ensure_benchmarks_loaded()
+    bench = create_benchmark_instance(benchmark, subset_list or None)
+    adapter = LoggedAdapter(
+        ModelAdapterHF(
+            model,
+            cfg,
+            model_kwargs=dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa"),
+            device="cuda",
+        ),
+        f"{out}/answers.jsonl",
+        run,
+    )
+    if len(adapter):
+        print(
+            f"continuing: {len(adapter)} requests are answered in {out}/answers.jsonl"
+        )
 
     # The runner scores the rows and saves them with their contexts; keep the rows it
     # scored to save them without.
@@ -109,10 +133,7 @@ def main(
     rows = scored["rows"]
     if "context" in rows.columns:
         rows = rows.assign(
-            context_hash=[
-                hashlib.sha256(str(context).encode("utf-8")).hexdigest()[:16]
-                for context in rows["context"]
-            ]
+            context_hash=[context_hash(context) for context in rows["context"]]
         ).drop(columns=["context"])
     with open(f"{out}/results.jsonl", "w") as f:
         for record in rows.to_dict(orient="records"):
@@ -120,14 +141,11 @@ def main(
     if not keep_raw and os.path.exists(f"{out}/raw_results.csv"):
         os.remove(f"{out}/raw_results.csv")
     summary = dict(
-        benchmark=benchmark,
-        subsets=subset_list,
-        model=model,
-        attention="dense" if dense else vars(cfg),
-        generation_kwargs=generation_kwargs,
-        request_kwargs=request_kwargs,
+        run,
         rows=len(rows),
-        minutes=round(minutes, 1),
+        requests_answered=adapter.answered,
+        requests_from_answers_file=adapter.reused,
+        minutes=round(minutes, 1),  # of this invocation
         metrics=metrics,
     )
     print(json.dumps(summary, indent=2, default=str))

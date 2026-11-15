@@ -238,9 +238,17 @@ python scripts/hf_request_bench.py --ctx 131072 --sparse "carry_threshold=0.2" \
 # quality: dense, carried set and default from one prefill per prompt
 python scripts/hf_ruler_multi_eval.py --data ruler128k --subsets niah_multikey_3,qa_1 \
     --ranges 0..24 --sparse "carry_threshold=0.2" --variants "/carry_threshold=0.0"
-# a benchmark through Skylight's runner
+# a benchmark through Skylight's runner, dense and sparse; every answer is written to
+# answers.jsonl as it arrives, and the same command continues an interrupted run
 python scripts/benchmark_request_eval.py --benchmark loft_rag --subsets nq_128k \
-    --max_new_tokens 4096 --sparse "carry_threshold=0.2" --compile_layers True
+    --max_new_tokens 4096 --dense --compile_layers True --out results/loft_nq_dense
+python scripts/benchmark_request_eval.py --benchmark loft_rag --subsets nq_128k \
+    --max_new_tokens 4096 --sparse "carry_threshold=0.2" --compile_layers True \
+    --out results/loft_nq_carried
+# the two runs prompt by prompt, scored by the benchmark's own post_run_evaluate, with a
+# paired-bootstrap interval on the difference
+python scripts/benchmark_paired_stats.py --benchmark loft_rag --metric subspan_em \
+    --scale 100 --baseline results/loft_nq_dense --other results/loft_nq_carried
 # tests (the kernel tests need a GPU)
 pytest tests/unit/sparse_attention/efficient_attention/test_two_stage_block_sparse.py \
     tests/unit/adapters/test_graph_decode.py
