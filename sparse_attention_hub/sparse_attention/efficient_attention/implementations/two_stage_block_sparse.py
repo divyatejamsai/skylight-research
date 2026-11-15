@@ -12,6 +12,8 @@ from ..base import EfficientAttention, EfficientAttentionConfig, SparseAttention
 
 META_KEY = "two_stage_block_sparse"
 CARRY_KEY = "two_stage_block_sparse_carry"
+# The kernels take the query-key products with Triton's dot, which needs 16 columns.
+MIN_HEAD_DIM = 16
 
 
 @dataclass
@@ -94,6 +96,10 @@ class TwoStageBlockSparse(EfficientAttention):
     decode step, on a static one.
     """
 
+    # ModelAdapterHF's static-cache decode path (generation_kwargs["graph_decode"]) may
+    # use this attention: see "Static caches" above.
+    supports_static_cache_decode: bool = True
+
     def __init__(
         self,
         sparse_attention_config: SparseAttentionConfig,
@@ -167,6 +173,12 @@ class TwoStageBlockSparse(EfficientAttention):
                 scaling,
                 dropout,
                 **kwargs,
+            )
+
+        if queries.shape[-1] < MIN_HEAD_DIM:
+            raise NotImplementedError(
+                f"TwoStageBlockSparse needs a head dimension of at least {MIN_HEAD_DIM}; "
+                f"this model has {queries.shape[-1]}."
             )
 
         from ....kernels.block_sparse_decode import (

@@ -2,11 +2,13 @@
 
 import random
 import string
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
+from transformers import StaticCache
+from transformers.cache_utils import StaticLayer
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
@@ -18,6 +20,44 @@ from .model_servers.huggingface import ModelServerHF
 from .utils.config import ModelServerConfig
 
 INT_MAX = 2**31 - 1
+
+# The static-cache decode path (generation_kwargs["graph_decode"]).
+# Name its dense attention is registered under.
+_DENSE_DECODE_ATTENTION: str = "skylight_dense_decode"
+# Free slots the static cache keeps beyond the tokens that will be written to it.
+_STATIC_CACHE_MARGIN: int = 8
+# Under a CUDA graph the generated tokens are read back once in this many decode steps
+# to look for a stop token (a read is a host synchronisation).
+_STOP_CHECK_EVERY: int = 16
+
+
+def _dense_decode_attention(
+    module: torch.nn.Module,
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float = 1.0,
+    dropout: float = 0.0,
+    **kwargs: Dict[str, Any],
+) -> Tuple[torch.Tensor, None]:
+    """Dense attention of one decode step on a static cache.
+
+    SDPA with native grouped-query attention: K/V are not repeated per query head, and
+    attention_mask limits the preallocated cache to its live tokens.
+    """
+    out = torch.nn.functional.scaled_dot_product_attention(
+        queries, keys, values, attn_mask=attention_mask, scale=scaling, enable_gqa=True
+    )
+    return out.transpose(1, 2), None
+
+
+ALL_ATTENTION_FUNCTIONS.register(_DENSE_DECODE_ATTENTION, _dense_decode_attention)
+
+
+def _graph_available(device: torch.device) -> bool:
+    """Whether decode steps on this device can be captured in a CUDA graph."""
+    return device.type == "cuda"
 
 
 class ModelAdapterHF(ModelAdapter):
@@ -128,12 +168,20 @@ class ModelAdapterHF(ModelAdapter):
 
         Args:
             request: The request to process
+            generation_kwargs: ``max_new_tokens``, and optionally ``graph_decode``. With
+                ``graph_decode=True`` the tokens after the first are generated on a
+                preallocated cache with the decode step captured in a CUDA graph (see
+                ``_decode_on_static_cache``): the same greedy decoding, without the
+                per-step launch cost of the eager loop. It needs dense attention or a
+                sparse attention with ``supports_static_cache_decode``.
 
         Returns:
             response: The response to the request
         """
         max_context_length: int = request_kwargs.get("max_context_length", INT_MAX)
         max_new_tokens: int = generation_kwargs.get("max_new_tokens", INT_MAX)
+        if generation_kwargs.get("graph_decode"):
+            self._check_graph_decode()  # before the prefill, not after it
         print(
             " Processing request with max_context_length: ",
             max_context_length,
@@ -176,6 +224,11 @@ class ModelAdapterHF(ModelAdapter):
             context_tokens = context_tokens.to(input_device)
         print(f"Context tokens: {context_tokens.shape}")
         responses: List[str] = []
+        # The prefill's logits are not used. The static-cache path asks for one position
+        # only: at 128k tokens the full logits are tens of GB.
+        prefill_kwargs: Dict[str, Any] = (
+            {"logits_to_keep": 1} if generation_kwargs.get("graph_decode") else {}
+        )
 
         self.model.eval()
         with torch.no_grad():
@@ -196,6 +249,7 @@ class ModelAdapterHF(ModelAdapter):
                         past_key_values=None,
                         use_cache=True,
                         sparse_meta_data=sparse_meta_data,
+                        **prefill_kwargs,
                     )
 
                     with self.enable_sparse_mode():
@@ -211,6 +265,7 @@ class ModelAdapterHF(ModelAdapter):
                         context_tokens,
                         past_key_values=None,
                         use_cache=True,
+                        **prefill_kwargs,
                     )
 
                     response_text = self._generate_response(
@@ -483,6 +538,18 @@ class ModelAdapterHF(ModelAdapter):
 
         generated_ids = [last_outputs.logits[0, -1].argmax()]
 
+        if generation_kwargs.get("graph_decode"):
+            # Step 2 on a preallocated cache, the decode step replayed from a CUDA graph.
+            generated_ids += self._decode_on_static_cache(
+                generated_ids[0],
+                past_key_values,
+                max_new_tokens - 1,
+                should_stop_token_ids,
+            )
+            return self.tokenizer.decode(
+                torch.stack(generated_ids), skip_special_tokens=True
+            )
+
         # ------------------------------------------------------------------
         # Step 2: continue normal autoregressive generation, one token at a time
         # ------------------------------------------------------------------
@@ -511,3 +578,193 @@ class ModelAdapterHF(ModelAdapter):
         )
 
         return answer
+
+    @contextmanager
+    def _attention_implementation(self, name: str) -> Generator[None, None, None]:
+        """Temporarily switch every module of the model to a registered attention.
+
+        Args:
+            name: Key of the attention function in ALL_ATTENTION_FUNCTIONS.
+
+        Yields:
+            None
+        """
+        modules: List[Any] = [
+            module
+            for module in self.model.modules()
+            if hasattr(getattr(module, "config", None), "_attn_implementation")
+        ]
+        original: List[str] = [m.config._attn_implementation for m in modules]
+        try:
+            for module in modules:
+                module.config._attn_implementation = name
+            yield
+        finally:
+            for module, implementation in zip(modules, original):
+                module.config._attn_implementation = implementation
+
+    def _to_static_cache(
+        self, past_key_values: Any, n_cached: int, room: int
+    ) -> StaticCache:
+        """Move a prefill cache into a StaticCache with room for more tokens.
+
+        The source cache is emptied layer by layer as it is copied, so the peak memory is
+        one cache and one layer, not two caches.
+
+        Args:
+            past_key_values: The cache the prefill returned (per-layer keys and values).
+            n_cached: Number of tokens it holds.
+            room: Free slots to preallocate after them.
+
+        Returns:
+            The static cache, holding the same n_cached tokens.
+        """
+        cache = StaticCache(config=self.model.config, max_cache_len=n_cached + room)
+        if any(type(layer) is not StaticLayer for layer in cache.layers):
+            # A sliding-window layer keeps fewer tokens than the sequence and counts them
+            # on the host, which a replay would not advance.
+            raise NotImplementedError(
+                "graph_decode does not support models with sliding-window cache layers"
+            )
+        for dst, src in zip(cache.layers, past_key_values.layers):
+            dst.lazy_initialization(src.keys[:, :, :0])
+            dst.keys[:, :, :n_cached] = src.keys[:, :, :n_cached]
+            dst.values[:, :, :n_cached] = src.values[:, :, :n_cached]
+            src.keys = src.values = None
+            if dst.keys.is_cuda:
+                # The freed layer is a little too small for the next one to reuse.
+                torch.cuda.empty_cache()
+        return cache
+
+    def _check_graph_decode(self) -> None:
+        """Raise NotImplementedError if this adapter cannot decode with graph_decode."""
+        if self.hybrid:
+            raise NotImplementedError(
+                "graph_decode does not support hybrid models (token-by-token prefill)"
+            )
+        if self._sparse_attention_available and not getattr(
+            self.sparse_attention, "supports_static_cache_decode", False
+        ):
+            raise NotImplementedError(
+                f"{type(self.sparse_attention).__name__} does not support graph_decode: "
+                "it needs an attention with supports_static_cache_decode"
+            )
+
+    def _decode_on_static_cache(
+        self,
+        first_token: torch.Tensor,
+        past_key_values: Any,
+        max_steps: int,
+        stop_token_ids: List[int],
+    ) -> List[torch.Tensor]:
+        """Greedy decoding on a preallocated cache, the step replayed from a CUDA graph.
+
+        The eager loop of ``_generate_response`` launches every kernel of every layer
+        from Python at each token, which bounds its speed whatever the attention costs.
+        Here the prefill cache is moved into a StaticCache, the first step runs eagerly
+        (it builds the sparse attention's per-layer state), and the remaining steps are
+        replays of one captured CUDA graph. Generated tokens are read back once in
+        ``_STOP_CHECK_EVERY`` steps to look for a stop token; what was generated after
+        it is dropped, so the result is the eager loop's. Without CUDA the same steps
+        run eagerly.
+
+        Dense attention runs as SDPA with native grouped-query attention. A sparse
+        attention must set ``supports_static_cache_decode``: it has to read the sequence
+        length from position_ids (the cache is longer than the sequence) and to run
+        without host-side reads after its first step.
+
+        Args:
+            first_token: The token the prefill produced (0-dim), fed to the first step.
+            past_key_values: The prefill cache; it is consumed.
+            max_steps: Largest number of tokens to generate after first_token.
+            stop_token_ids: Generation ends after the first of these.
+
+        Returns:
+            The generated tokens after first_token (0-dim tensors), through the first
+            stop token if there is one.
+        """
+        self._check_graph_decode()
+        if max_steps <= 0:
+            return []
+        n_cached: int = int(past_key_values.get_seq_length())
+        cache: StaticCache = self._to_static_cache(
+            past_key_values, n_cached, max_steps + _STATIC_CACHE_MARGIN
+        )
+        device = first_token.device
+        token: torch.Tensor = first_token.view(1, 1).clone()
+        position: torch.Tensor = torch.full(
+            (1,), n_cached, device=device, dtype=torch.long
+        )
+        slots: torch.Tensor = torch.arange(cache.max_cache_len, device=device)
+        # A 4D mask is used as given. The mask HuggingFace would build for a custom
+        # attention copies a host scalar, which a CUDA graph cannot capture.
+        mask: torch.Tensor = torch.zeros(
+            1, 1, 1, cache.max_cache_len, device=device, dtype=torch.bool
+        )
+        model_kwargs: Dict[str, Any] = {
+            "input_ids": token,
+            "attention_mask": mask,
+            "position_ids": position.view(1, 1),
+            "cache_position": position,
+            "past_key_values": cache,
+            "use_cache": True,
+            "logits_to_keep": 1,
+        }
+        attention: Any
+        if self._sparse_attention_available:
+            # The caller has enabled sparse mode. A new sequence on a new cache needs a
+            # new state.
+            model_kwargs["sparse_meta_data"] = {}
+            attention = nullcontext()
+        else:
+            attention = self._attention_implementation(_DENSE_DECODE_ATTENTION)
+
+        def step() -> None:
+            # Every tensor is updated in place: a replay reads and writes the same ones.
+            mask.copy_((slots <= position).expand_as(mask))
+            logits: torch.Tensor = self.model(**model_kwargs).logits[:, -1]
+            token.copy_(logits.argmax(-1, keepdim=True))
+            position.add_(1)
+
+        # A model without a stop token has None here: nothing stops it but max_steps.
+        stop: torch.Tensor = torch.tensor(
+            [i for i in stop_token_ids if i is not None],
+            device=device,
+            dtype=torch.long,
+        )
+        tokens: List[torch.Tensor] = []
+        # A CUDA graph records one device's stream and is replayed on the current
+        # device: on another GPU the step would run instead of being recorded, and the
+        # replays would do nothing.
+        current_device: Any = (
+            torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+        )
+        with attention, current_device:
+            step()
+            tokens.append(token.clone())
+            checked: int = 0
+            graph: Optional[torch.cuda.CUDAGraph] = None
+            if _graph_available(device) and max_steps > 1:
+                if not bool(torch.isin(tokens[0], stop).any()):
+                    graph = torch.cuda.CUDAGraph()
+                    # torch's default capture stream is the one of the device the
+                    # process captured its first graph on: give it this device's.
+                    with torch.cuda.graph(graph, stream=torch.cuda.Stream(device)):
+                        step()  # recorded, not run: the state is still the eager step's
+            every: int = _STOP_CHECK_EVERY if graph is not None else 1
+            while len(tokens) < max_steps:
+                if len(tokens) - checked >= every:
+                    if bool(torch.isin(torch.cat(tokens[checked:], dim=1), stop).any()):
+                        break
+                    checked = len(tokens)
+                if graph is not None:
+                    graph.replay()
+                else:
+                    step()
+                tokens.append(token.clone())
+        del graph
+        generated: torch.Tensor = torch.cat(tokens, dim=1)[0]
+        hits: torch.Tensor = torch.isin(generated, stop).nonzero()
+        if hits.numel() > 0:
+            generated = generated[: int(hits[0]) + 1]
+        return list(generated.unbind(0))
