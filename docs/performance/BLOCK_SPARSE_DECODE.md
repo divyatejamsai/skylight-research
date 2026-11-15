@@ -95,19 +95,20 @@ that subset.
 ### A second model family
 
 `microsoft/Phi-4-mini-instruct` (24 query heads on 8 key-value heads), with the settings
-above unchanged and nothing tuned on it. The speed was predicted (1.30× to 1.55×) and
-written down before the run.
+above unchanged and nothing tuned on it. The speed (1.30× to 1.55×) and the quality bar
+were predicted and written down before the run.
 
 | | Qwen3-4B | Phi-4-mini |
 |---|---|---|
 | Speedup, one sequence of about 129k cached tokens, `carry_threshold=0.2` | 1.45× | 1.50× |
-| RULER-128k, 250 prompts, `carry_threshold=0.2` − dense | −0.2 [−1.9, +1.4] | being rerun |
+| RULER-128k, 250 prompts, dense | 75.1 | 49.8 |
+| `carry_threshold=0.2` − dense | −0.2 [−1.9, +1.4] | +0.7 [−1.2, +2.6] |
+| Default − dense | −4.1 [−6.6, −1.8] | −1.1 [−2.9, +0.7] |
 
-The first RULER-128k run on Phi-4-mini is not quoted. Its decodes did not stop at the
-model's end-of-turn token (`<|end|>`, which is in the model's generation config and
-not the tokenizer's eos), so every mode was scored on text that ran past the answer.
-The evaluation scripts now take their end tokens from `static_decode.end_token_ids`,
-and the run is being repeated.
+Phi-4-mini is weaker at this length, and two of the ten subsets are at the floor in
+every mode. Its decodes end at the model's end-of-turn token (`<|end|>`, named in the
+model's generation config and not the tokenizer's eos); the evaluation scripts take
+their end tokens from `static_decode.end_token_ids`.
 
 ### Through `process_request`
 

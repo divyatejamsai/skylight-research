@@ -62,7 +62,7 @@ def line(path: str, seed: int) -> None:
     )
     print(
         f"  B over A  {np.exp(s):.4f} [{np.exp(lo):.4f}, {np.exp(hi):.4f}]   "
-        f"(median of whole-generation ratios {np.exp(np.median(total)):.4f}; "
+        f"(median of whole-generation ratios {np.exp(np.median(total)):.4f}, "
         f"mean {np.exp(total.mean()):.4f})"
     )
     print(

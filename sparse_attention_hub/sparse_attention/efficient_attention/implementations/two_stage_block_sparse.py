@@ -177,8 +177,8 @@ class TwoStageBlockSparse(EfficientAttention):
 
         if queries.shape[-1] < MIN_HEAD_DIM:
             raise NotImplementedError(
-                f"TwoStageBlockSparse needs a head dimension of at least {MIN_HEAD_DIM}; "
-                f"this model has {queries.shape[-1]}."
+                f"TwoStageBlockSparse needs a head dimension of at least {MIN_HEAD_DIM}, "
+                f"and this model has {queries.shape[-1]}."
             )
 
         from ....kernels.block_sparse_decode import (

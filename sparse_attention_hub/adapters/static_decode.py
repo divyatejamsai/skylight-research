@@ -130,6 +130,40 @@ def static_cache(config: Any, max_cache_len: int) -> StaticCache:
     return cache
 
 
+def _initialize_layer(layer: Any, keys: torch.Tensor, values: torch.Tensor) -> None:
+    """Allocate a static layer for keys and values like these (empty tensors will do).
+
+    transformers 4 takes the keys alone, transformers 5 the keys and the values.
+    """
+    if len(inspect.signature(layer.lazy_initialization).parameters) == 1:
+        layer.lazy_initialization(keys)
+    else:
+        layer.lazy_initialization(keys, values)
+
+
+def capacity(cache: StaticCache) -> int:
+    """Number of token slots of a cache from ``static_cache``."""
+    return int(cache.layers[0].max_cache_len)
+
+
+def set_cached_length(cache: StaticCache, n_cached: int) -> None:
+    """Tell a static cache that it holds n_cached tokens.
+
+    transformers 5 keeps the number of tokens of a static layer in a tensor on the
+    device and writes new tokens after it; transformers 4 writes at the positions it is
+    given and keeps no count. The count is set in place, because a recorded graph and
+    compiled code hold its address.
+
+    Args:
+        cache: A cache from ``static_cache`` / ``move_to_static_cache``.
+        n_cached: Tokens it holds; the next ones are written after them.
+    """
+    for layer in cache.layers:
+        length = getattr(layer, "cumulative_length", None)
+        if isinstance(length, torch.Tensor):
+            length.fill_(n_cached)
+
+
 def move_to_static_cache(
     config: Any,
     past_key_values: Any,
@@ -160,8 +194,15 @@ def move_to_static_cache(
     cache = static_cache(config, n_cached + room)
     for dst, src in zip(cache.layers, past_key_values.layers):
         target = device if device is not None else src.keys.device
-        shape = (batch, src.keys.shape[1], 0, src.keys.shape[3])
-        dst.lazy_initialization(src.keys.new_empty(shape).to(target))
+        _initialize_layer(
+            dst,
+            src.keys.new_empty(batch, src.keys.shape[1], 0, src.keys.shape[3]).to(
+                target
+            ),
+            src.values.new_empty(batch, src.values.shape[1], 0, src.values.shape[3]).to(
+                target
+            ),
+        )
         dst.keys[:, :, :n_cached] = src.keys[:1, :, :n_cached].to(target)
         dst.values[:, :, :n_cached] = src.values[:1, :, :n_cached].to(target)
         if not keep_source:
@@ -169,6 +210,7 @@ def move_to_static_cache(
             if target.type == "cuda":
                 # The freed layer is a little too small for the next one to reuse.
                 torch.cuda.empty_cache()
+    set_cached_length(cache, n_cached)
     return cache
 
 
@@ -324,9 +366,10 @@ def forward_on_static_cache(
         The logits after the last token, [vocab].
     """
     q = tokens.shape[1]
-    assert tokens.shape[0] == 1 and q >= 1 and cache.max_cache_len >= n_cached + q
+    assert tokens.shape[0] == 1 and q >= 1 and capacity(cache) >= n_cached + q
+    set_cached_length(cache, n_cached)
     positions = torch.arange(n_cached, n_cached + q, device=tokens.device)
-    slots = torch.arange(cache.max_cache_len, device=tokens.device)
+    slots = torch.arange(capacity(cache), device=tokens.device)
     # Token j attends the slots up to its own: a 4D mask is used as given.
     mask = (slots[None, :] <= positions[:, None])[None, None]
     model_kwargs: Dict[str, Any] = {
@@ -419,12 +462,13 @@ def decode_on_static_cache(
     Returns:
         A DecodeOutput.
     """
-    assert steps >= 1 and cache.max_cache_len >= n_cached + steps, (n_cached, steps)
+    assert steps >= 1 and capacity(cache) >= n_cached + steps, (n_cached, steps)
+    set_cached_length(cache, n_cached)
     device = first_token.device
     token = first_token.reshape(-1)[:1].view(1, 1).expand(batch, 1).clone()
     position = torch.full((1,), n_cached, device=device, dtype=torch.long)
     index = torch.zeros(1, device=device, dtype=torch.long)  # the step being run
-    slots = torch.arange(cache.max_cache_len, device=device)
+    slots = torch.arange(capacity(cache), device=device)
     # A 4D mask is used as given (see the module docstring).
     mask = torch.zeros(batch, 1, 1, slots.numel(), device=device, dtype=torch.bool)
     tops = torch.zeros(steps, batch, device=device, dtype=torch.long)

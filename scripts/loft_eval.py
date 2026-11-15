@@ -63,7 +63,7 @@ def score_loft(subset: str, preds, refs) -> float:
 def decode_stop(adapter, cache, first, ctx, batch, new_tokens, mode):
     """hf_ruler_multi_eval._decode with one change: the decode ends at the first look
     for an end token that finds one (a look every CHUNK steps)."""
-    assert batch == 1 and cache.max_cache_len >= ctx + new_tokens + 8
+    assert batch == 1 and static_decode.capacity(cache) >= ctx + new_tokens + 8
     m, t = adapter.model, adapter.tokenizer
     stop = static_decode.end_token_ids(m, t)
     if mode == "sparse":

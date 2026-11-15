@@ -50,7 +50,7 @@ def _static_from(cfg, pkv, ctx, room):
 def _decode(adapter, cache, first, ctx, batch, new_tokens, mode):
     """hf_graph_decode_bench._decode at batch 1 on a StaticCache that already holds the
     prefill. Returns (first-step logits row 0, tokens, None)."""
-    assert batch == 1 and cache.max_cache_len >= ctx + new_tokens + 8
+    assert batch == 1 and static_decode.capacity(cache) >= ctx + new_tokens + 8
     m = adapter.model
     if mode == "sparse":
         attention, meta = adapter.enable_sparse_mode(), {}

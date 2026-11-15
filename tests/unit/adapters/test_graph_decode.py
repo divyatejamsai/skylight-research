@@ -254,7 +254,7 @@ class TestGraphDecodeOnCPU:
             pkv = adapter.model(ids, use_cache=True).past_key_values
         keys = [layer.keys.clone() for layer in pkv.layers]
         cache = static_decode.move_to_static_cache(adapter.model.config, pkv, 30, 10)
-        assert cache.max_cache_len == 40
+        assert static_decode.capacity(cache) == 40
         for layer, src, k in zip(cache.layers, pkv.layers, keys):
             assert src.keys is None and src.values is None
             assert layer.keys.shape[2] == 40

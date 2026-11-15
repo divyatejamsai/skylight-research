@@ -463,7 +463,7 @@ def main(
     ids = tok(text, return_tensors="pt").input_ids
     span = context_len + decode_len
     starts = [i * (ids.shape[1] - span) // max(1, windows - 1) for i in range(windows)]
-    print(f"{ids.shape[1]} tokens; windows at {starts}; device={device}", flush=True)
+    print(f"{ids.shape[1]} tokens, windows at {starts}, device={device}", flush=True)
 
     logger = MicroMetricLogger()
     results: Dict[str, Dict[str, float]] = {}
