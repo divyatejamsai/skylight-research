@@ -15,8 +15,13 @@ with a log-sum-exp combine. With every block selected it is a dense flash-decodi
 which is the apples-to-apples baseline for speed.
 """
 
+# Names follow Triton's conventions (upper case for pointers and compile-time
+# constants) and the shape letters of the docstrings (B, H, N, D, P), and a kernel
+# takes every buffer, stride and constant as a parameter of its own.
+# pylint: disable=invalid-name,too-many-positional-arguments
+
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
@@ -39,25 +44,25 @@ import triton.language as tl
 # keeps forced candidates apart and sorts only the free ones (False: one padded tile).
 # mass_slots / mass_warps / mass_stages: candidate blocks per block-mass program, its
 # warps, and its software-pipelining depth.
-TUNE = dict(
-    decode_blocks_per_split=4,
-    decode_warps=4,
-    decode_stages=2,
-    mass_slots=2,
-    mass_warps=2,
-    mass_stages=2,
-    search_radix=4,
-    sort_max_blocks=1024,
-    prefilter_stats=True,
-    prefilter_warps=16,
-    final_warps=16,
-    prefilter_chunk=512,
-    prefilter_chunk_warps=8,
-    prefilter_digit=4,
-    prefilter_region=512,
-    prefilter_region_alpha=0.5,
-    final_split=True,
-)
+TUNE: Dict[str, Any] = {
+    "decode_blocks_per_split": 4,
+    "decode_warps": 4,
+    "decode_stages": 2,
+    "mass_slots": 2,
+    "mass_warps": 2,
+    "mass_stages": 2,
+    "search_radix": 4,
+    "sort_max_blocks": 1024,
+    "prefilter_stats": True,
+    "prefilter_warps": 16,
+    "final_warps": 16,
+    "prefilter_chunk": 512,
+    "prefilter_chunk_warps": 8,
+    "prefilter_digit": 4,
+    "prefilter_region": 512,
+    "prefilter_region_alpha": 0.5,
+    "final_split": True,
+}
 
 
 def _rounds(bisection_steps: int, radix: int) -> int:
@@ -337,7 +342,7 @@ def block_sparse_decode(
 
 
 def dense_block_index(
-    B: int, Hkv: int, N: int, block_size: int, device
+    B: int, Hkv: int, N: int, block_size: int, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Every block selected: turns block_sparse_decode into dense flash-decoding."""
     P = (N + block_size - 1) // block_size
@@ -797,19 +802,19 @@ def _append_kernel(
 
 
 def append_kv(
-    k_new,
-    v_new,
-    k_buf,
-    v_buf,
-    pos,
-    kmin=None,
-    kmax=None,
+    k_new: Optional[torch.Tensor],
+    v_new: Optional[torch.Tensor],
+    k_buf: torch.Tensor,
+    v_buf: torch.Tensor,
+    pos: torch.Tensor,
+    kmin: Optional[torch.Tensor] = None,
+    kmax: Optional[torch.Tensor] = None,
     block_size: int = 64,
-    ksum=None,
-    vsum=None,
-    k8=None,
-    kscale=None,
-    seq_out=None,
+    ksum: Optional[torch.Tensor] = None,
+    vsum: Optional[torch.Tensor] = None,
+    k8: Optional[torch.Tensor] = None,
+    kscale: Optional[torch.Tensor] = None,
+    seq_out: Optional[torch.Tensor] = None,
 ) -> None:
     """Write one decode token's K/V ([B, Hkv, D] or [B, Hkv, 1, D]) at position pos (device
     scalar) and, when kmin/kmax are given, fold it into its block's channel min/max (and,
@@ -1035,8 +1040,16 @@ def _tail_kernel(
 
 
 def block_sparse_decode_fused(
-    q, k, v, block_idx, counts, block_size, num_splits=None, seq_len=None, tail=None
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_idx: torch.Tensor,
+    counts: torch.Tensor,
+    block_size: int,
+    num_splits: Optional[int] = None,
+    seq_len: Optional[torch.Tensor] = None,
+    tail: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
     """block_sparse_decode with the split merge as one Triton kernel instead of torch ops.
 
     tail: optional dict(aux=<select_blocks_two_stage(..., return_aux=True) aux>,
@@ -1858,12 +1871,10 @@ def _final_select_split_kernel(
 
 def _keep_count(n: int, frac: float) -> int:
     """ceil(n * frac) in fp32, as the prefilter kernels compute it."""
-    return math.ceil(
-        (
-            torch.tensor(n, dtype=torch.float32)
-            * torch.tensor(frac, dtype=torch.float32)
-        ).item()
+    product = torch.tensor(n, dtype=torch.float32) * torch.tensor(
+        frac, dtype=torch.float32
     )
+    return math.ceil(float(product.item()))
 
 
 @torch.no_grad()
@@ -1887,7 +1898,7 @@ def select_blocks_two_stage(
     return_aux: bool = False,
     carry_score: Optional[torch.Tensor] = None,
     carry_threshold: float = 0.0,
-):
+) -> Tuple[Any, ...]:
     """Bound prefilter -> int8 block mass on candidates -> TopCdf + floor, per KV head.
 
     q: [B, Hq, D] scaled; kmin/kmax: [B, Hkv, P, D]; k8: [B, Hkv, N, D] int8 and kscale
@@ -2152,45 +2163,45 @@ def select_blocks_two_stage(
             num_warps=_warps(TUNE["final_warps"], bp_sel),
         )
     if return_aux:
-        aux = dict(
-            s2=scores2,
-            has_s2=has_s2,
-            isc=isc,
-            lse=lse,
-            pk=pk,
-            cand=cand,
-            ncand=ncand,
-            kept=kept,
-            max_cand=max_cand,
-        )
+        aux = {
+            "s2": scores2,
+            "has_s2": has_s2,
+            "isc": isc,
+            "lse": lse,
+            "pk": pk,
+            "cand": cand,
+            "ncand": ncand,
+            "kept": kept,
+            "max_cand": max_cand,
+        }
         return idx, counts, aux
     return idx, counts
 
 
 @torch.no_grad()
 def select_blocks_two_stage_ref(
-    q,
-    kmin,
-    kmax,
-    k8,
-    kscale,
-    block_size,
-    cdf_threshold,
-    floor_fraction,
-    max_fraction,
-    prefilter_fraction=0.25,
-    sink_blocks=8,
-    local_blocks=8,
-    seq_len=None,
-    prefilter_shared=True,
-    ksum=None,
-    prefilter_mean=False,
-    return_cand=False,
-    region=0,
-    region_alpha=0.5,
-    carry_score=None,
-    carry_threshold=0.0,
-):
+    q: torch.Tensor,
+    kmin: torch.Tensor,
+    kmax: torch.Tensor,
+    k8: torch.Tensor,
+    kscale: torch.Tensor,
+    block_size: int,
+    cdf_threshold: float,
+    floor_fraction: float,
+    max_fraction: float,
+    prefilter_fraction: float = 0.25,
+    sink_blocks: int = 8,
+    local_blocks: int = 8,
+    seq_len: Optional[torch.Tensor] = None,
+    prefilter_shared: bool = True,
+    ksum: Optional[torch.Tensor] = None,
+    prefilter_mean: bool = False,
+    return_cand: bool = False,
+    region: int = 0,
+    region_alpha: float = 0.5,
+    carry_score: Optional[torch.Tensor] = None,
+    carry_threshold: float = 0.0,
+) -> Tuple[Any, ...]:
     """Readable torch reference of select_blocks_two_stage (same block sets), for tests.
 
     region / region_alpha: the shared prefilter's per-region quotas (TUNE prefilter_region
@@ -2285,7 +2296,7 @@ def select_blocks_two_stage_ref(
             order = free_ids[probs[bi, h, free_ids].argsort(descending=True)].tolist()
             k_floor = math.ceil(int(c.sum()) * floor_fraction)
             acc = float(probs[bi, h, f_ids].sum())
-            chosen = []
+            chosen: List[int] = []
             for r, p in enumerate(order):
                 if len(f_ids) + len(chosen) >= cap:
                     break
@@ -2302,7 +2313,16 @@ def select_blocks_two_stage_ref(
     return idx, counts
 
 
-def _region_top_ref(shared, lshared, cur_p, n_keep, region, alpha, sink, local):
+def _region_top_ref(
+    shared: torch.Tensor,
+    lshared: torch.Tensor,
+    cur_p: int,
+    n_keep: int,
+    region: int,
+    alpha: float,
+    sink: int,
+    local: int,
+) -> torch.Tensor:
     """Per-region top sets of the shared prefilter, with the kernel's quotas: each region's
     share mixes its free-block share (weight alpha) and its ranking-probability share
     (from shared), rounded cumulatively from n_keep and capped at its free blocks; blocks
@@ -2310,7 +2330,7 @@ def _region_top_ref(shared, lshared, cur_p, n_keep, region, alpha, sink, local):
     starts = list(range(0, cur_p, region))
     nf = torch.tensor(
         [
-            max(0, min(min(lo + region, cur_p), cur_p - local) - sink)
+            max(0, min(lo + region, cur_p, cur_p - local) - sink)
             - max(0, min(lo, cur_p - local) - sink)
             for lo in starts
         ],
@@ -2337,12 +2357,16 @@ def _region_top_ref(shared, lshared, cur_p, n_keep, region, alpha, sink, local):
     return top
 
 
-def _block_token_counts(P, block_size, n, device):
+def _block_token_counts(
+    P: int, block_size: int, n: int, device: torch.device
+) -> torch.Tensor:
     starts = torch.arange(P, device=device) * block_size
     return (n - starts).clamp(min=1, max=block_size).float()
 
 
-def _mean_key_scores_ref(q, ksum, block_size, n):
+def _mean_key_scores_ref(
+    q: torch.Tensor, ksum: torch.Tensor, block_size: int, n: int
+) -> torch.Tensor:
     """q . block-mean key per query head, rounded like the kernel -> [B, Hkv, G, P]."""
     B, Hq, D = q.shape
     Hkv, P = ksum.shape[1], ksum.shape[2]
@@ -2352,22 +2376,22 @@ def _mean_key_scores_ref(q, ksum, block_size, n):
 
 
 def two_stage_tail_ref(
-    q,
-    k,
-    v,
-    k8,
-    kscale,
-    ksum,
-    vsum,
-    block_idx,
-    counts,
-    cand,
-    block_size,
-    rho=0.6,
-    seq_len=None,
-    t1=True,
-    t2=True,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k8: torch.Tensor,
+    kscale: torch.Tensor,
+    ksum: torch.Tensor,
+    vsum: torch.Tensor,
+    block_idx: torch.Tensor,
+    counts: torch.Tensor,
+    cand: torch.Tensor,
+    block_size: int,
+    rho: float = 0.6,
+    seq_len: Optional[torch.Tensor] = None,
+    t1: bool = True,
+    t2: bool = True,
+) -> torch.Tensor:
     """Torch reference of block_sparse_decode_fused(..., tail=...): attention over the
     selected blocks plus every unselected block as one block-mean pseudo-token."""
     B, Hq, D = q.shape
@@ -2387,7 +2411,8 @@ def two_stage_tail_ref(
     sel, cand = sel[..., :cur_p], cand[..., :cur_p]
     qg = q.view(B, Hkv, G, D).float()
 
-    def blocked(x):  # [B, Hkv, G, n] -> [B, Hkv, G, cur_p, bs], -inf padded
+    def blocked(x: torch.Tensor) -> torch.Tensor:
+        # [B, Hkv, G, n] -> [B, Hkv, G, cur_p, bs], -inf padded
         return torch.nn.functional.pad(x, (0, pad), value=ninf).view(
             B, Hkv, G, cur_p, block_size
         )

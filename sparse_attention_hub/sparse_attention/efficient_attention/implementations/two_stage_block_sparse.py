@@ -140,7 +140,7 @@ class TwoStageBlockSparse(EfficientAttention):
         Returns:
             Attention output (b, s_q, h_q, d) and None.
         """
-        sparse_meta_data: Dict[Any, Any] = kwargs.pop("sparse_meta_data", None)  # type: ignore[assignment]
+        sparse_meta_data: Any = kwargs.pop("sparse_meta_data", None)
         if sparse_meta_data is None:
             raise ValueError(
                 "sparse_meta_data must be provided in kwargs while calling custom_attention()"
@@ -150,9 +150,9 @@ class TwoStageBlockSparse(EfficientAttention):
                 "TwoStageBlockSparse does not support attention-sink (s_aux) models."
             )
         kwargs.pop("s_aux", None)
-        layer_idx = kwargs.get("layer_idx", 0)
+        layer_idx: Any = kwargs.get("layer_idx", 0)
         state = self._layer_state(sparse_meta_data, layer_idx)
-        position_ids: Optional[torch.Tensor] = kwargs.get("position_ids")  # type: ignore[assignment]
+        position_ids: Any = kwargs.get("position_ids")
         if state.get("static") and not state["dense"] and queries.shape[2] > 1:
             # Tokens a multi-token call wrote into the static cache: fold them in while
             # eager (decode steps only append their own token).
@@ -280,7 +280,11 @@ class TwoStageBlockSparse(EfficientAttention):
             ),
             carry_threshold=c.carry_threshold,
         )
-        tail = dict(aux=sel[2], vsum=state["vsum"], rho=c.tail_rho) if c.tail else None
+        tail = (
+            {"aux": sel[2], "vsum": state["vsum"], "rho": c.tail_rho}
+            if c.tail
+            else None
+        )
         out = block_sparse_decode_fused(
             q, keys, values, sel[0], sel[1], c.block_size, seq_len=seq_len, tail=tail
         )
@@ -401,14 +405,16 @@ class TwoStageBlockSparse(EfficientAttention):
             # Whole blocks: the whole static cache, else room for 1024 more (or double).
             grow_to = keys.shape[2] if static else max(n + 1024, 2 * cap)
             new_cap = math.ceil(grow_to / bs) * bs
-            grown = dict(
-                kmin=keys.new_empty(B, H, new_cap // bs, D),
-                kmax=keys.new_empty(B, H, new_cap // bs, D),
-                ksum=torch.empty(B, H, new_cap // bs, D, device=keys.device),
-                vsum=torch.empty(B, H, new_cap // bs, D, device=keys.device),
-                k8=torch.empty(B, H, new_cap, D, device=keys.device, dtype=torch.int8),
-                ks=torch.empty(B, H, new_cap, device=keys.device),
-            )
+            grown = {
+                "kmin": keys.new_empty(B, H, new_cap // bs, D),
+                "kmax": keys.new_empty(B, H, new_cap // bs, D),
+                "ksum": torch.empty(B, H, new_cap // bs, D, device=keys.device),
+                "vsum": torch.empty(B, H, new_cap // bs, D, device=keys.device),
+                "k8": torch.empty(
+                    B, H, new_cap, D, device=keys.device, dtype=torch.int8
+                ),
+                "ks": torch.empty(B, H, new_cap, device=keys.device),
+            }
             if n_old:
                 p_old = math.ceil(n_old / bs)
                 for name in ("kmin", "kmax", "ksum", "vsum"):

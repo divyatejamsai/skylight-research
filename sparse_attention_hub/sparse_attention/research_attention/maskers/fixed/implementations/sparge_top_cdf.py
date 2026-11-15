@@ -196,8 +196,9 @@ class SpargeTopCdfMasker(FixedMasker):
 
         groups: int = _get_num_key_value_groups(queries, keys)
         keys_rep: torch.Tensor = repeat_kv(keys, groups)
+        layer_idx: Any = kwargs.get("layer_idx")
         block_sel: torch.Tensor = self._select_blocks(
-            keys_rep, queries, attention_mask, scaling, kwargs.get("layer_idx"), groups
+            keys_rep, queries, attention_mask, scaling, layer_idx, groups
         )  # [B,H,Q,P] bool
 
         dense_prev: torch.Tensor = previous_mask.get_dense_mask()
