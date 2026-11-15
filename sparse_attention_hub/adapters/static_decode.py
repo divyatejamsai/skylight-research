@@ -25,11 +25,15 @@ way and has to hold wherever a decode step is captured:
 * A sparse attention keeps per-sequence state in ``sparse_meta_data``: a new sequence on
   a new cache needs a new dictionary, and the attention must read the sequence length
   from ``position_ids`` (the cache is longer than the sequence).
+* Compiled decoder layers (``compile_decoder_layers``) are compiled for one decode step
+  on a static cache. A prefill or a question run through them would be compiled as
+  well, for its own shapes: ``layer_stance`` runs such calls eagerly.
 """
 
 import functools
 import inspect
 import time
+import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Sequence
@@ -46,6 +50,8 @@ CACHE_MARGIN: int = 8
 # Under a graph the generated tokens are read back once in this many steps to look for an
 # end token (a read is a host synchronisation).
 STOP_CHECK_EVERY: int = 16
+# Models whose decoder layers ``compile_decoder_layers`` has compiled.
+_COMPILED_MODELS: "weakref.WeakSet[torch.nn.Module]" = weakref.WeakSet()
 
 
 def _dense_attention(  # pylint: disable=unused-argument
@@ -307,24 +313,61 @@ def attention_implementation(
             module.config._attn_implementation = implementation
 
 
+def can_compile_layers(model: torch.nn.Module) -> bool:
+    """Whether ``compile_decoder_layers`` and ``layer_stance`` work for this model."""
+    return hasattr(torch.compiler, "set_stance") and hasattr(
+        getattr(model, "model", None), "layers"
+    )
+
+
+def layers_compiled(model: torch.nn.Module) -> bool:
+    """Whether ``compile_decoder_layers`` has compiled this model's decoder layers."""
+    return model in _COMPILED_MODELS
+
+
 def compile_decoder_layers(
     model: torch.nn.Module, dynamic: Optional[bool] = False
 ) -> None:
     """torch.compile every decoder layer (fused norms, RoPE, activations, residuals).
 
-    Call it after the prefill: the layers are compiled for the shapes of a decode step.
-    The attention functions have to stay out of the compiled graphs: decode with
-    ``opaque_attention=True``.
+    Nothing is compiled here: a layer is compiled at its first call, for the shapes of
+    that call. That call has to be a decode step. Either call this after the prefill, or
+    run everything that is not a decode step inside ``layer_stance(model,
+    "force_eager")``. The attention functions have to stay out of the compiled graphs:
+    decode with ``opaque_attention=True``.
 
     Args:
         model: The HuggingFace model.
         dynamic: torch.compile's ``dynamic``. False compiles for the exact shapes, so a
-            cache of another length is compiled again.
+            cache of another length is compiled again (13 to 43 s for Qwen3-4B). None
+            compiles for the exact shapes first and once more, with the cache length
+            free, when a second length arrives; it then serves every length. True
+            compiles once with every size free, which takes longest and runs slowest.
     """
     torch._dynamo.config.cache_size_limit = 256  # layer_idx specializes per layer
     torch._dynamo.config.accumulated_cache_size_limit = 4096
     for layer in model.model.layers:
         layer.compile(mode="max-autotune-no-cudagraphs", dynamic=dynamic)
+    _COMPILED_MODELS.add(model)
+
+
+@contextmanager
+def layer_stance(model: torch.nn.Module, stance: str) -> Generator[None, None, None]:
+    """Choose how compiled decoder layers run inside the block.
+
+    Args:
+        model: The HuggingFace model. Without compiled layers this does nothing.
+        stance: "force_eager" runs the layers as plain modules (a prefill, a question,
+            the eager loop); "default" runs their compiled code (decode steps).
+
+    Yields:
+        None
+    """
+    if not layers_compiled(model):
+        yield
+        return
+    with torch.compiler.set_stance(stance):
+        yield
 
 
 def keep_attention_out_of_compiled_graphs() -> None:

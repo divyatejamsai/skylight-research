@@ -130,22 +130,49 @@ class ModelAdapterHF(ModelAdapter):
 
         Args:
             request: The request to process
-            generation_kwargs: ``max_new_tokens``, and optionally ``graph_decode``. With
-                ``graph_decode=True`` the context is prefilled once for all the
-                questions and moved into a preallocated cache; each question is added
-                to it and answered there, the decode step replayed from a CUDA graph
-                (see ``_answer_on_static_cache``). It is the same greedy decoding,
-                without the per-step launch cost of the eager loop and without a
-                prefill per question. It needs dense attention or a sparse attention
-                with ``supports_static_cache_decode``.
+            generation_kwargs: ``max_new_tokens``, and optionally ``graph_decode`` and
+                ``compile_layers``. With ``graph_decode=True`` the context is prefilled
+                once for all the questions and moved into a preallocated cache; each
+                question is added to it and answered there, the decode step replayed
+                from a CUDA graph (see ``_answer_on_static_cache``). It is the same
+                greedy decoding, without the per-step launch cost of the eager loop
+                and without a prefill per question. It needs dense attention or a
+                sparse attention with ``supports_static_cache_decode``. With
+                ``compile_layers=True`` as well, the decode steps run through
+                torch.compile'd decoder layers. The layers are compiled once per
+                model and process: at the first request, and once more at the first
+                request of another length.
 
         Returns:
             response: The response to the request
         """
+        compile_layers: bool = bool(generation_kwargs.get("compile_layers"))
+        if compile_layers and not generation_kwargs.get("graph_decode"):
+            raise ValueError("compile_layers needs graph_decode")
+        if generation_kwargs.get("graph_decode"):
+            # before the prefill, not after it
+            self._check_graph_decode(compile_layers)
+        if compile_layers and not static_decode.layers_compiled(self.model):
+            # dynamic=None: one more compilation when a second cache length arrives,
+            # then none (False compiles again for every length).
+            static_decode.compile_decoder_layers(self.model, dynamic=None)
+        # Compiled layers are for decode steps on a static cache: the prefill, the
+        # questions and the eager loop run them as plain modules.
+        with static_decode.layer_stance(self.model, "force_eager"):
+            return self._process_request(
+                request, generation_kwargs, request_kwargs, **kwargs
+            )
+
+    def _process_request(
+        self,
+        request: Request,
+        generation_kwargs: Dict[str, Any],
+        request_kwargs: Dict[str, Any],
+        **kwargs: Dict[str, Any],
+    ) -> RequestResponse:
+        """The body of ``process_request``, after its checks."""
         max_context_length: int = request_kwargs.get("max_context_length", INT_MAX)
         max_new_tokens: int = generation_kwargs.get("max_new_tokens", INT_MAX)
-        if generation_kwargs.get("graph_decode"):
-            self._check_graph_decode()  # before the prefill, not after it
         print(
             " Processing request with max_context_length: ",
             max_context_length,
@@ -202,7 +229,11 @@ class ModelAdapterHF(ModelAdapter):
                 cache = self._prefill_static_cache(context_tokens, room)
                 responses = [
                     self._answer_on_static_cache(
-                        cache, context_tokens.shape[1], ids, new_tokens
+                        cache,
+                        context_tokens.shape[1],
+                        ids,
+                        new_tokens,
+                        compiled=bool(generation_kwargs.get("compile_layers")),
                     )
                     for ids in question_ids
                 ]
@@ -575,6 +606,7 @@ class ModelAdapterHF(ModelAdapter):
         n_context: int,
         question_tokens: torch.Tensor,
         max_new_tokens: int,
+        compiled: bool = False,
     ) -> str:
         """Add one question to a prefilled context and generate its answer.
 
@@ -588,6 +620,7 @@ class ModelAdapterHF(ModelAdapter):
             n_context: Tokens of context in it.
             question_tokens: [1, q] question token ids.
             max_new_tokens: Largest number of tokens to generate.
+            compiled: Run the decode steps through the compiled decoder layers.
 
         Returns:
             The decoded answer.
@@ -610,24 +643,40 @@ class ModelAdapterHF(ModelAdapter):
             )
             generated: List[torch.Tensor] = [logits.argmax()]
             if max_new_tokens > 1:
-                out = static_decode.decode_on_static_cache(
-                    self.model,
-                    cache,
-                    generated[0],
-                    n_context + question_tokens.shape[1],
-                    max_new_tokens - 1,
-                    attention=nullcontext() if sparse else None,
-                    sparse_meta_data=meta,
-                    stop_token_ids=stop_token_ids,
+                stance: Any = (
+                    static_decode.layer_stance(self.model, "default")
+                    if compiled
+                    else nullcontext()
                 )
+                with stance:
+                    out = static_decode.decode_on_static_cache(
+                        self.model,
+                        cache,
+                        generated[0],
+                        n_context + question_tokens.shape[1],
+                        max_new_tokens - 1,
+                        attention=nullcontext() if sparse else None,
+                        sparse_meta_data=meta,
+                        stop_token_ids=stop_token_ids,
+                        opaque_attention=compiled,
+                    )
                 generated += list(out.tokens[0].unbind(0))
         answer: str = self.tokenizer.decode(
             torch.stack(generated), skip_special_tokens=True
         )
         return answer
 
-    def _check_graph_decode(self) -> None:
-        """Raise NotImplementedError if this adapter cannot decode with graph_decode."""
+    def _check_graph_decode(self, compile_layers: bool = False) -> None:
+        """Raise NotImplementedError if this adapter cannot decode with graph_decode
+        (and, when asked for, with compiled decoder layers)."""
+        if compile_layers:
+            if next(self.model.parameters()).device.type != "cuda":
+                raise NotImplementedError("compile_layers needs the model on a GPU")
+            if not static_decode.can_compile_layers(self.model):
+                raise NotImplementedError(
+                    "compile_layers needs torch.compiler.set_stance (PyTorch 2.6 or "
+                    "later) and a model with its decoder layers in model.model.layers"
+                )
         if self.hybrid:
             raise NotImplementedError(
                 "graph_decode does not support hybrid models (token-by-token prefill)"

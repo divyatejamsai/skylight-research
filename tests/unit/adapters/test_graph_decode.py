@@ -379,6 +379,30 @@ class TestGraphDecodeOnCPU:
             _generate(adapter, _request(), max_new_tokens=6, graph_decode=False)
         static.assert_not_called()
 
+    def test_compile_layers_needs_graph_decode(self) -> None:
+        adapter = _adapter(_model())
+        with pytest.raises(ValueError, match="compile_layers needs graph_decode"):
+            _generate(adapter, _request(), max_new_tokens=6, compile_layers=True)
+
+    def test_compile_layers_is_refused_without_a_gpu(self) -> None:
+        adapter = _adapter(_model())
+        with patch.object(adapter, "_prefill_static_cache") as prefill:
+            with pytest.raises(NotImplementedError, match="GPU"):
+                _generate(
+                    adapter,
+                    _request(),
+                    max_new_tokens=6,
+                    graph_decode=True,
+                    compile_layers=True,
+                )
+        prefill.assert_not_called()  # refused before the prefill
+        assert not static_decode.layers_compiled(adapter.model)
+
+    def test_layer_stance_without_compiled_layers(self) -> None:
+        # Nothing is compiled, so no stance is set (and its name is not looked at).
+        with static_decode.layer_stance(_model(), "no such stance"):
+            pass
+
 
 def _decode_tokens(
     adapter: ModelAdapterHF,
@@ -577,6 +601,41 @@ class TestGraphDecodeOnCUDA:
             for q in questions
         ]
         assert together == alone and len(set(together)) == 3
+
+    @pytest.mark.parametrize("sparse", [False, True])
+    def test_compiled_layers_in_the_request_loop(self, sparse: bool) -> None:
+        # compile_layers: the decode steps run through compiled decoder layers, and the
+        # prefill, the questions and the eager loop do not. Requests of two lengths (the
+        # second makes the layers compile again), then the other paths on that model.
+        dtype = torch.bfloat16 if sparse else torch.float32
+        model = _model("cuda", dtype, self.KERNEL_HIDDEN)
+        config = TwoStageBlockSparseConfig(carry_threshold=0.2) if sparse else None
+        adapter = _adapter(model, config)
+        requests = [
+            Request(context=_words(n, 1), questions=_words(8, 2), answer_prefix="")
+            for n in (self.N_CONTEXT, self.N_CONTEXT + 200)
+        ]
+        plain = [
+            _generate(adapter, request, max_new_tokens=24, graph_decode=True)
+            for request in requests
+        ]
+        eager = _generate(adapter, requests[0], max_new_tokens=24)
+        assert not static_decode.layers_compiled(model)
+        compiled = [
+            _generate(
+                adapter,
+                request,
+                max_new_tokens=24,
+                graph_decode=True,
+                compile_layers=True,
+            )
+            for request in requests
+        ]
+        assert static_decode.layers_compiled(model)
+        assert compiled == plain
+        again = _generate(adapter, requests[0], max_new_tokens=24, graph_decode=True)
+        assert again == plain[0]
+        assert _generate(adapter, requests[0], max_new_tokens=24) == eager
 
     def test_process_request_sparse(self) -> None:
         model = _model("cuda", torch.bfloat16, self.KERNEL_HIDDEN)

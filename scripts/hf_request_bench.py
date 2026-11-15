@@ -11,8 +11,15 @@ generation_kwargs["graph_decode"]:
     TwoStageBlockSparse with the --sparse overrides.
 
 One request per mode: a wikitext context of --ctx tokens and a short question, with stop
-tokens disabled so that every mode generates exactly --new_tokens tokens. Decoder layers
-are not compiled (process_request does not compile them).
+tokens disabled so that every mode generates exactly --new_tokens tokens. With
+--compile_layers the graph modes also pass generation_kwargs["compile_layers"], and the
+decode steps run through torch.compile'd decoder layers.
+
+--rounds N repeats the graph modes N times in one process, a round being one request per
+mode, with the context --round_step tokens shorter in each round. That is a benchmark
+loop in small: later requests come after several graph captures and at cache lengths
+the compiled layers have not seen. results[mode]["rounds"] has every round;
+results[mode] itself is the first.
 
 What is timed:
   * graph modes: the replays, from the first one to the return of the decode. Also
@@ -33,10 +40,11 @@ Reading the other fields:
     upper bound on what a later request pays.
   * generated_tokens is the decoded text tokenised again, a check on its length.
 
-A process captures one graph per graph mode. Run one dense and one sparse mode per fresh
-process (the fourth and later capture in a process is slower); --order sets which goes
-first. With --check the graph_sparse request is repeated with every step eager, and the
-two texts must be equal.
+A process captures one graph per graph mode and round. The fourth and later capture in
+a process is slower (about 0.8 ms per step, 0.2 ms with compiled layers), so the first
+round of a fresh process and a later round are two different figures; --order sets
+which mode goes first. With --check the graph_sparse request is repeated with every
+step eager, and the two texts must be equal.
 
 Example:
     python scripts/hf_request_bench.py --ctx 131072 --modes graph_dense,graph_sparse \
@@ -123,20 +131,26 @@ def _run(
     ctx: int,
     new_tokens: int,
     graph: bool,
+    compile_layers: bool = False,
 ) -> Dict[str, Any]:
     clock.reset()
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     t0 = clock.now()
+    generation_kwargs: Dict[str, Any] = {
+        "max_new_tokens": new_tokens,
+        "graph_decode": graph,
+    }
+    if graph and compile_layers:
+        generation_kwargs["compile_layers"] = True
     text = adapter.process_request(
-        request,
-        {"max_new_tokens": new_tokens, "graph_decode": graph},
-        {"max_context_length": ctx},
+        request, generation_kwargs, {"max_context_length": ctx}
     ).responses
     t1 = clock.now()
     m = clock.marks
     res: Dict[str, Any] = dict(
+        ctx=ctx,
         new_tokens=new_tokens,
         total_s=t1 - t0,
         prefill_s=m["generate_in"] - t0,
@@ -164,6 +178,9 @@ def main(
     sparse: str = "",
     order: str = "dense_first",
     check: bool = False,
+    compile_layers: bool = False,
+    rounds: int = 1,
+    round_step: int = 0,
     out: Optional[str] = None,
 ) -> None:
     cfg = _config(sparse)
@@ -212,7 +229,7 @@ def main(
         kind, attention = mode.split("_")
         adapter = adapters[attention]
         if kind == "graph":
-            res = _run(adapter, clock, request, ctx, new_tokens, graph=True)
+            res = _run(adapter, clock, request, ctx, new_tokens, True, compile_layers)
         else:
             first = _run(adapter, clock, request, ctx, new_tokens, graph=False)
             short = _run(adapter, clock, request, ctx, short_tokens, graph=False)
@@ -241,10 +258,39 @@ def main(
             flush=True,
         )
 
+    # Later rounds of the graph modes: a shorter context each time.
+    for mode in mode_list:
+        if mode.startswith("graph"):
+            first_round = {k: v for k, v in results[mode].items() if k != "text"}
+            results[mode]["rounds"] = [first_round]
+    for index in range(1, rounds):
+        for mode in mode_list:
+            if not mode.startswith("graph"):
+                continue
+            res = _run(
+                adapters[mode.split("_")[1]],
+                clock,
+                request,
+                ctx - index * round_step,
+                new_tokens,
+                True,
+                compile_layers,
+            )
+            res.pop("text")
+            results[mode]["rounds"].append(res)
+            print(
+                mode,
+                f"round {index + 1}",
+                {k: round(v, 4) for k, v in res.items() if isinstance(v, float)},
+                flush=True,
+            )
+
     if check:
         # Graph replays against eager steps on the same static-cache path.
         adapter = adapters["sparse"]
         kwargs = {"max_new_tokens": short_tokens, "graph_decode": True}
+        if compile_layers:
+            kwargs["compile_layers"] = True
         replayed = adapter.process_request(
             request, kwargs, {"max_context_length": ctx}
         ).responses
@@ -266,6 +312,9 @@ def main(
         ctx=ctx,
         prompt_tokens=n_context + n_question,
         order=order,
+        compile_layers=compile_layers,
+        rounds=rounds,
+        round_step=round_step,
         sparse_config=vars(cfg),
         gpu=torch.cuda.get_device_name(),
         results=results,
