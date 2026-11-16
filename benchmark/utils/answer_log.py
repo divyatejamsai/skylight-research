@@ -12,12 +12,17 @@ the same command run again continues where the first one stopped.
 ``run`` describes what produced the answers (model, attention, options). It is written
 as the first line of the file, and a file written for a different ``run`` is refused.
 Only use it with deterministic decoding: a reused answer is the answer of the first run.
+
+A ``recorder`` measures something while a request is answered (for example
+benchmark/utils/micro_metric_meter.py). Its start() and stop() are called around every
+request the adapter answers, and what stop() returns is written with the answer, so a
+continued run has the measurements of all its requests, each measured once.
 """
 
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from sparse_attention_hub.adapters.base import Request, RequestResponse
 
@@ -55,12 +60,24 @@ class LoggedAdapter:
     """An adapter whose answers are written to a file and reused when asked again.
 
     Everything except process_request is the wrapped adapter's.
+
+    measured: what the recorder returned for each answered request (a JSON value),
+    by context_hash, one entry per request with that context; it includes the
+    requests read back from the file.
     """
 
-    def __init__(self, adapter: Any, path: str, run: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        adapter: Any,
+        path: str,
+        run: Dict[str, Any],
+        recorder: Optional[Any] = None,
+    ) -> None:
         self._adapter: Any = adapter
         self._path: str = path
+        self._recorder: Optional[Any] = recorder
         self._answers: Dict[str, Responses] = {}
+        self.measured: Dict[str, List[Any]] = {}
         self.reused: int = 0
         self.answered: int = 0
         run = _plain(run)
@@ -92,6 +109,10 @@ class LoggedAdapter:
                 first = False
             else:
                 self._answers[entry["key"]] = entry["responses"]
+                if "measured" in entry:
+                    self.measured.setdefault(entry["context_hash"], []).append(
+                        entry["measured"]
+                    )
             kept += len(line)
         if first:
             raise ValueError(f"{self._path} does not start with a run description")
@@ -125,16 +146,30 @@ class LoggedAdapter:
         if key in self._answers:
             self.reused += 1
             return RequestResponse(responses=self._answers[key])
-        response: RequestResponse = self._adapter.process_request(
-            request, generation_kwargs, request_kwargs, **kwargs
-        )
-        self._append(
-            {
-                "key": key,
-                "context_hash": context_hash(request.context),
-                "responses": response.responses,
-            }
-        )
+        response: RequestResponse
+        entry: Dict[str, Any] = {
+            "key": key,
+            "context_hash": context_hash(request.context),
+        }
+        if self._recorder is None:
+            response = self._adapter.process_request(
+                request, generation_kwargs, request_kwargs, **kwargs
+            )
+            entry["responses"] = response.responses
+        else:
+            self._recorder.start()
+            try:
+                response = self._adapter.process_request(
+                    request, generation_kwargs, request_kwargs, **kwargs
+                )
+            finally:
+                measured: Any = self._recorder.stop()
+            entry["responses"] = response.responses
+            entry["measured"] = _plain(measured)
+            self.measured.setdefault(entry["context_hash"], []).append(
+                entry["measured"]
+            )
+        self._append(entry)
         self._answers[key] = response.responses
         self.answered += 1
         return response

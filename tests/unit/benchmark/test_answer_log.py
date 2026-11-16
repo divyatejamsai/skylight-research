@@ -191,3 +191,83 @@ class TestLoggedAdapter:
         assert (tmp_path / "cut" / "raw_results.csv").read_text() == (
             tmp_path / "whole" / "raw_results.csv"
         ).read_text()
+
+
+class Stopwatch:
+    """A recorder: counts its requests and returns the count of the one it measured."""
+
+    def __init__(self) -> None:
+        self.started: int = 0
+        self.stopped: int = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def stop(self) -> Dict[str, Any]:
+        self.stopped += 1
+        return {"request": self.stopped, "pair": (1, 2)}
+
+
+class TestRecorder:
+    def test_what_it_measures_is_kept_with_the_answer(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "answers.jsonl")
+        watch = Stopwatch()
+        adapter = LoggedAdapter(CountingAdapter(), path, RUN, watch)
+        adapter.process_request(_request("c1"), {}, {})
+        adapter.process_request(_request("c2"), {}, {})
+        adapter.process_request(_request("c1"), {}, {})  # from the log: not measured
+        assert (watch.started, watch.stopped) == (2, 2)
+        # As a JSON round trip leaves it, the same as when it is read back.
+        assert adapter.measured == {
+            context_hash("c1"): [{"request": 1, "pair": [1, 2]}],
+            context_hash("c2"): [{"request": 2, "pair": [1, 2]}],
+        }
+        lines = [json.loads(line) for line in open(path, encoding="utf-8")]
+        assert [line.get("measured") for line in lines] == [
+            None,
+            {"request": 1, "pair": [1, 2]},
+            {"request": 2, "pair": [1, 2]},
+        ]
+
+    def test_a_continued_run_has_the_measurements_of_the_first(
+        self, tmp_path: Path
+    ) -> None:
+        path = str(tmp_path / "answers.jsonl")
+        first = LoggedAdapter(CountingAdapter(), path, RUN, Stopwatch())
+        first.process_request(_request("c1"), {}, {})
+        watch = Stopwatch()
+        second = LoggedAdapter(CountingAdapter(), path, RUN, watch)
+        assert second.measured == first.measured
+        second.process_request(_request("c1"), {}, {})
+        second.process_request(_request("c2"), {}, {})
+        assert watch.started == 1
+        assert second.measured == {
+            context_hash("c1"): [{"request": 1, "pair": [1, 2]}],
+            context_hash("c2"): [{"request": 1, "pair": [1, 2]}],
+        }
+
+    def test_two_requests_on_one_context_are_both_kept(self, tmp_path: Path) -> None:
+        adapter = LoggedAdapter(
+            CountingAdapter(), str(tmp_path / "answers.jsonl"), RUN, Stopwatch()
+        )
+        adapter.process_request(_request("c1", "q1"), {}, {})
+        adapter.process_request(_request("c1", "q2"), {}, {})
+        assert [m["request"] for m in adapter.measured[context_hash("c1")]] == [1, 2]
+
+    def test_it_is_stopped_when_the_request_fails(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "answers.jsonl")
+        watch = Stopwatch()
+        adapter = LoggedAdapter(CountingAdapter(fail_at=0), path, RUN, watch)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            adapter.process_request(_request(), {}, {})
+        assert (watch.started, watch.stopped) == (1, 1)
+        # Nothing of the failed request is logged or kept.
+        assert adapter.measured == {} and len(adapter) == 0
+        assert len(open(path, encoding="utf-8").readlines()) == 1
+
+    def test_without_one_nothing_is_measured(self, tmp_path: Path) -> None:
+        path = str(tmp_path / "answers.jsonl")
+        adapter = LoggedAdapter(CountingAdapter(), path, RUN)
+        adapter.process_request(_request(), {}, {})
+        assert adapter.measured == {}
+        assert "measured" not in json.loads(open(path).readlines()[1])

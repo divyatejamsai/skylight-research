@@ -67,6 +67,31 @@ LoftRag(subsets_to_run=["nq_128k"]).run_benchmark(
 )
 ```
 
+### Density and output error
+
+`TwoStageBlockSparse` logs Skylight's two micro-metrics as a research masker does, under
+the same names and with the same metadata (`layer_idx`, `q_len`, `k_len`), so a run of it
+reads like a masker's:
+
+- `research_attention_density`: for a sparse decode step, the share of the cached tokens
+  that lie in the selected blocks, averaged over KV heads (every query head of a group
+  attends its KV head's blocks, so this is the density of the equivalent mask). The
+  question of a request is attended densely and logs 1.
+- `research_attention_output_error`: the relative L2 error of the step's attention
+  output against dense attention. It costs one dense attention per call.
+
+Logging reads values back to the host at every call, so it needs the default loop: with
+`graph_decode` and one of the two metrics enabled, `process_request` refuses before the
+prefill. `scripts/benchmark_request_eval.py --graph_decode False --micro_metrics
+density,error` measures them request by request and keeps their means (per request in
+`results.jsonl`, over the run in `summary.json`) instead of one line per attention call.
+
+The same script runs Skylight's research maskers on the same prompts (`--maskers`), and
+with `--decode_only` they mask the decode steps alone and read the question densely, as
+this method does. By default a research masker also masks the call that reads the
+question, which this method never does, so the two are only on the same footing with
+`--decode_only`.
+
 ## Settings
 
 | Field | Default | Meaning |
@@ -245,6 +270,15 @@ python scripts/benchmark_request_eval.py --benchmark loft_rag --subsets nq_128k 
 python scripts/benchmark_request_eval.py --benchmark loft_rag --subsets nq_128k \
     --max_new_tokens 4096 --sparse "carry_threshold=0.2" --compile_layers True \
     --out results/loft_nq_carried
+# density and output error of the method, request by request (the default loop), and one
+# of Skylight's maskers on the same prompts, masking the decode steps only
+python scripts/benchmark_request_eval.py --benchmark ruler32k --subsets vt \
+    --sparse "carry_threshold=0.2" --graph_decode False --micro_metrics density,error \
+    --out results/vt_carried_density
+python scripts/benchmark_request_eval.py --benchmark ruler32k --subsets vt \
+    --maskers "SinkMaskerConfig(sink_size=128);LocalMaskerConfig(window_size=128);OracleTopKConfig(heavy_size=0.05)" \
+    --decode_only --graph_decode False --micro_metrics density \
+    --out results/vt_oracle_top_k
 # the two runs prompt by prompt, scored by the benchmark's own post_run_evaluate, with a
 # paired-bootstrap interval on the difference
 python scripts/benchmark_paired_stats.py --benchmark loft_rag --metric subspan_em \

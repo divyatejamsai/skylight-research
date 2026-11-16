@@ -2,11 +2,25 @@
 
 The benchmark is created by name from Skylight's registry and run with
 Benchmark.run_benchmark: its data, its prompts, its request loop and its metrics. This
-script only chooses the attention (TwoStageBlockSparse with the --sparse overrides, or
-none with --dense) and the options of the request loop: generation_kwargs["graph_decode"]
-(the static-cache decode path) and, with --compile_layers, "compile_layers" (compiled
-decoder layers in that path), and optionally max_requests (the first rows of the
-dataset) and max_context_length (tokens of context kept).
+script only chooses the attention (TwoStageBlockSparse with the --sparse overrides,
+research maskers with --maskers, or none with --dense) and the options of the request
+loop: generation_kwargs["graph_decode"] (the static-cache decode path) and, with
+--compile_layers, "compile_layers" (compiled decoder layers in that path), and
+optionally max_requests (the first rows of the dataset), skip_requests (rows left out
+before those) and max_context_length (tokens of context kept).
+
+--maskers takes the masker configs by the names of their classes, in the order they
+are applied: "SinkMaskerConfig(sink_size=128);LocalMaskerConfig(window_size=128);
+OracleTopKConfig(heavy_size=0.05)". Research maskers have no static-cache path: run
+them with --graph_decode False. With --decode_only they mask the decode steps only
+(calls with one query token) and the question is attended densely, which is what
+TwoStageBlockSparse does.
+
+--micro_metrics density (or density,error) measures research_attention_density (and
+research_attention_output_error) request by request (benchmark/utils/
+micro_metric_meter.py): their means over decode steps and over the other calls go to
+summary.json and, per request, to results.jsonl. It needs --graph_decode False too: a
+replayed decode step logs nothing.
 
 Besides the runner's own metrics.json and config.json, the rows are saved without their
 contexts in results.jsonl (one row per request, with the prediction, the reference and
@@ -44,7 +58,18 @@ from benchmark.benchmark_registry import (
     ensure_benchmarks_loaded,
 )
 from benchmark.utils.answer_log import LoggedAdapter, context_hash
+from benchmark.utils.masker_spec import (
+    DecodeOnlyResearchAttention,
+    masker_configs_from_text,
+)
+from benchmark.utils.micro_metric_meter import MicroMetricMeter, mean_of
 from sparse_attention_hub.adapters import ModelAdapterHF
+from sparse_attention_hub.sparse_attention import ResearchAttentionConfig
+
+MICRO_METRICS: Dict[str, str] = {
+    "density": "research_attention_density",
+    "error": "research_attention_output_error",
+}
 
 
 def _plain(value: Any) -> Any:
@@ -64,8 +89,12 @@ def main(
     model: str = "Qwen/Qwen3-4B-Instruct-2507",
     sparse: str = "",
     dense: bool = False,
+    maskers: str = "",
+    decode_only: bool = False,
+    micro_metrics: str = "",
     max_new_tokens: int = 0,
     max_requests: int = 0,
+    skip_requests: int = 0,
     max_context_length: int = 0,
     graph_decode: bool = True,
     compile_layers: bool = False,
@@ -75,7 +104,20 @@ def main(
     if os.path.exists(f"{out}/summary.json"):
         print(f"{out} is complete (it has summary.json), nothing to run")
         return
-    cfg = None if dense else _config(sparse)
+    if isinstance(micro_metrics, (list, tuple)):  # fire splits a,b
+        micro_metrics = ",".join(micro_metrics)
+    measured: List[str] = [MICRO_METRICS[m] for m in micro_metrics.split(",") if m]
+    if graph_decode and (maskers or measured):
+        raise ValueError("--maskers and --micro_metrics need --graph_decode False")
+    if decode_only and not maskers:
+        raise ValueError("--decode_only is for --maskers")
+    if dense and measured:
+        raise ValueError("dense attention logs no micro-metrics")
+    cfg: Any = None
+    if maskers:
+        cfg = ResearchAttentionConfig(masker_configs=masker_configs_from_text(maskers))
+    elif not dense:
+        cfg = _config(sparse)
     subset_list: List[str] = (
         [s for s in subsets.split(",") if s]
         if isinstance(subsets, str)
@@ -91,25 +133,60 @@ def main(
         request_kwargs["max_requests"] = max_requests
     if max_context_length:
         request_kwargs["max_context_length"] = max_context_length
+    attention: Any = "dense"
+    if maskers:
+        # A config's parameters, without the tuner's search space it carries along.
+        attention = dict(
+            maskers=[
+                {
+                    type(m).__name__: {
+                        k: v for k, v in vars(m).items() if k != "search_space"
+                    }
+                }
+                for m in cfg.masker_configs
+            ],
+            decode_only=decode_only,
+        )
+    elif not dense:
+        attention = vars(cfg)
     run: Dict[str, Any] = dict(
         benchmark=benchmark,
         subsets=subset_list,
         model=model,
-        attention="dense" if dense else vars(cfg),
+        attention=attention,
         generation_kwargs=generation_kwargs,
         request_kwargs=request_kwargs,
     )
+    # Options that older runs did not have are named only when used, so that the
+    # answers of an older run are still continued by the command that began them.
+    if skip_requests:
+        run["skip_requests"] = skip_requests
+    if measured:
+        run["micro_metrics"] = measured
     ensure_benchmarks_loaded()
     bench = create_benchmark_instance(benchmark, subset_list or None)
+    if skip_requests:
+        load = bench._load_datasets
+
+        def load_after_skipped() -> pd.DataFrame:
+            return load().iloc[skip_requests:].reset_index(drop=True)
+
+        bench._load_datasets = load_after_skipped  # type: ignore[method-assign]
+    model_adapter = ModelAdapterHF(
+        model,
+        cfg,
+        model_kwargs=dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa"),
+        device="cuda",
+    )
+    if decode_only:  # before the first request: the adapter registers it then
+        model_adapter.sparse_attention = DecodeOnlyResearchAttention(
+            cfg, model_adapter.sparse_attention.maskers
+        )
     adapter = LoggedAdapter(
-        ModelAdapterHF(
-            model,
-            cfg,
-            model_kwargs=dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa"),
-            device="cuda",
-        ),
+        model_adapter,
         f"{out}/answers.jsonl",
         run,
+        MicroMetricMeter(measured, f"{out}/micro") if measured else None,
     )
     if len(adapter):
         print(
@@ -135,6 +212,21 @@ def main(
         rows = rows.assign(
             context_hash=[context_hash(context) for context in rows["context"]]
         ).drop(columns=["context"])
+    means: Dict[str, Dict[str, float]] = {}
+    for name in measured:
+        # Per row: the means over the requests of its context (one, as a rule).
+        short = [k for k, v in MICRO_METRICS.items() if v == name][0]
+        for kind in ("decode", "chunk"):
+            rows[f"{short}_{kind}"] = [
+                mean_of(adapter.measured.get(h, []), name, kind)
+                for h in rows["context_hash"]
+            ]
+        everything = [m for ms in adapter.measured.values() for m in ms]
+        means[name] = {
+            kind: mean_of(everything, name, kind) for kind in ("decode", "chunk")
+        }
+        means[name]["decode_calls"] = sum(m[name]["decode"][1] for m in everything)
+        means[name]["chunk_calls"] = sum(m[name]["chunk"][1] for m in everything)
     with open(f"{out}/results.jsonl", "w") as f:
         for record in rows.to_dict(orient="records"):
             f.write(json.dumps({k: _plain(v) for k, v in record.items()}) + "\n")
@@ -148,6 +240,8 @@ def main(
         minutes=round(minutes, 1),  # of this invocation
         metrics=metrics,
     )
+    if measured:
+        summary["micro_metric_means"] = means
     print(json.dumps(summary, indent=2, default=str))
     with open(f"{out}/summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
