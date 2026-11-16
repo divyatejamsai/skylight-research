@@ -180,6 +180,43 @@ class TestPairedBootstrap:
         assert paired_bootstrap(d, 500, seed=3) == paired_bootstrap(d, 500, seed=3)
         assert paired_bootstrap(d, 500, seed=3) != paired_bootstrap(d, 500, seed=4)
 
+    def test_one_prompt_per_cluster_is_the_plain_bootstrap(self) -> None:
+        rng = np.random.default_rng(5)
+        d = {"a": rng.normal(size=80), "b": rng.normal(size=33)}
+        labels = {task: [f"c{i}" for i in range(len(v))] for task, v in d.items()}
+        plain = paired_bootstrap(d, 500, seed=2)
+        clustered = paired_bootstrap(d, 500, seed=2, clusters=labels)
+        assert clustered.pop("clusters") == 113.0
+        assert clustered == plain
+
+    def test_prompts_that_share_a_context_widen_the_interval(self) -> None:
+        """50 contexts of 4 prompts with one value each: 50 observations, not 200."""
+        d = np.repeat(np.array([1.0, -1.0] * 25), 4)
+        labels = np.repeat(np.arange(50), 4)
+        plain = paired_bootstrap({"t": d}, reps=20000, seed=0)
+        clustered = paired_bootstrap(
+            {"t": d}, reps=20000, seed=0, clusters={"t": labels}
+        )
+        assert clustered["difference"] == plain["difference"] == 0.0
+        assert 0.10 < plain["high"] < 0.17  # standard error 1 / sqrt(200)
+        assert 0.23 < clustered["high"] < 0.33  # standard error 1 / sqrt(50)
+        assert clustered["clusters"] == 50.0
+
+    def test_clusters_of_different_sizes(self) -> None:
+        """The resampled value is the mean over prompts, not over clusters."""
+        d = np.array([3.0] * 9 + [3.0])
+        labels = ["big"] * 9 + ["small"]
+        result = paired_bootstrap({"t": d}, 300, clusters={"t": labels})
+        assert result["difference"] == result["low"] == result["high"] == 3.0
+        d = np.array([0.0] * 9 + [10.0])
+        result = paired_bootstrap({"t": d}, 4000, clusters={"t": labels})
+        assert result["difference"] == 1.0
+        assert result["low"] == 0.0 and result["high"] == 10.0
+
+    def test_one_label_per_prompt(self) -> None:
+        with pytest.raises(ValueError, match="cluster labels"):
+            paired_bootstrap({"t": np.zeros(3)}, 10, clusters={"t": ["a", "b"]})
+
     def test_nothing_to_compare(self) -> None:
         with pytest.raises(ValueError):
             paired_bootstrap({})

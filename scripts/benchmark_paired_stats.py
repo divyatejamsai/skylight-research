@@ -14,7 +14,9 @@ lower end of the interval is at least -M, and the interval contains 0 with the
 difference at least -M. --exclude names a file of "task context_hash" lines (prompts
 used to choose settings, say); the result is then also given without them. --keys
 names the columns that identify a prompt (rows that share them are paired in their
-order of appearance).
+order of appearance). --cluster names a column (context_hash) whose values are resampled
+whole instead of single prompts, and adds that interval: for benchmarks that ask several
+questions about one context, whose prompts are not independent.
 
 Example:
     python scripts/benchmark_paired_stats.py --benchmark ruler128k \
@@ -79,6 +81,8 @@ def _report(
     reps: int,
     seed: int,
     margin: Optional[float],
+    labels: Optional[np.ndarray] = None,
+    cluster: str = "",
 ) -> Dict[str, Any]:
     names: List[str] = sorted(set(tasks.tolist()))
     differences: Dict[str, np.ndarray] = {
@@ -113,6 +117,23 @@ def _report(
                 else "NOT MET"
             )
         )
+    if labels is not None:
+        clustered: Dict[str, float] = paired_bootstrap(
+            differences,
+            reps=reps,
+            seed=seed,
+            clusters={task: labels[tasks == task] for task in names},
+        )
+        result.update(
+            clusters=int(clustered["clusters"]),
+            clustered_low=clustered["low"],
+            clustered_high=clustered["high"],
+        )
+        print(
+            f"  resampling whole {cluster} within task "
+            f"({result['clusters']} of them): "
+            f"[{clustered['low']:+.3f}, {clustered['high']:+.3f}]"
+        )
     return result
 
 
@@ -126,6 +147,7 @@ def main(
     margin: Optional[float] = None,
     exclude: str = "",
     keys: str = ",".join(PAIR_KEYS),
+    cluster: str = "",
     reps: int = 10000,
     seed: int = 0,
     out: str = "",
@@ -148,6 +170,9 @@ def main(
     base: np.ndarray = row_scores(bench, base_rows, metric or None, scale)
     scored: np.ndarray = row_scores(bench, other_rows, metric or None, scale)
     tasks: np.ndarray = base_rows["task"].to_numpy().astype(str)
+    labels: Optional[np.ndarray] = (
+        base_rows[cluster].to_numpy().astype(str) if cluster else None
+    )
 
     print(
         f"{'task':24s} {'n':>5s} {'baseline':>8s} {'other':>8s} {'diff':>7s}  worse better"
@@ -176,7 +201,10 @@ def main(
         reps=reps,
         seed=seed,
         per_task=per_task,
-        all=_report("ALL PROMPTS", tasks, base, scored, reps, seed, margin),
+        cluster=cluster,
+        all=_report(
+            "ALL PROMPTS", tasks, base, scored, reps, seed, margin, labels, cluster
+        ),
     )
     if exclude:
         dropped: Set[Tuple[str, str]] = _excluded(exclude)
@@ -188,7 +216,15 @@ def main(
         )
         print(f"{int((~keep).sum())} of {len(keep)} prompts are named in {exclude}")
         results["without_excluded"] = _report(
-            "WITHOUT THEM", tasks[keep], base[keep], scored[keep], reps, seed, margin
+            "WITHOUT THEM",
+            tasks[keep],
+            base[keep],
+            scored[keep],
+            reps,
+            seed,
+            margin,
+            None if labels is None else labels[keep],
+            cluster,
         )
         results["excluded"] = int((~keep).sum())
     if out:
