@@ -11,7 +11,10 @@ the same command run again continues where the first one stopped.
 
 ``run`` describes what produced the answers (model, attention, options). It is written
 as the first line of the file, and a file written for a different ``run`` is refused.
-Only use it with deterministic decoding: a reused answer is the answer of the first run.
+A reused answer is the answer of the first run, so the decoding has to be deterministic.
+An attention that draws random numbers (a sampling masker) needs a ``seed``: torch is
+then seeded from the seed and the request before every request the adapter answers, and
+an answer no longer depends on which requests the process answered before it.
 
 A ``recorder`` measures something while a request is answered (for example
 benchmark/utils/micro_metric_meter.py). Its start() and stop() are called around every
@@ -23,6 +26,8 @@ import hashlib
 import json
 import os
 from typing import Any, Dict, List, Optional, Union
+
+import torch
 
 from sparse_attention_hub.adapters.base import Request, RequestResponse
 
@@ -51,6 +56,11 @@ def request_key(
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def request_seed(seed: int, key: str) -> int:
+    """The seed of one request: the run's seed and the request's key together."""
+    return (seed + int(key[:15], 16)) % 2**63
+
+
 def _plain(value: Any) -> Any:
     """What a value is after a JSON round trip (tuples become lists, and so on)."""
     return json.loads(json.dumps(value, sort_keys=True, default=str))
@@ -72,10 +82,12 @@ class LoggedAdapter:
         path: str,
         run: Dict[str, Any],
         recorder: Optional[Any] = None,
+        seed: Optional[int] = None,
     ) -> None:
         self._adapter: Any = adapter
         self._path: str = path
         self._recorder: Optional[Any] = recorder
+        self._seed: Optional[int] = seed
         self._answers: Dict[str, Responses] = {}
         self.measured: Dict[str, List[Any]] = {}
         self.reused: int = 0
@@ -146,6 +158,8 @@ class LoggedAdapter:
         if key in self._answers:
             self.reused += 1
             return RequestResponse(responses=self._answers[key])
+        if self._seed is not None:
+            torch.manual_seed(request_seed(self._seed, key))
         response: RequestResponse
         entry: Dict[str, Any] = {
             "key": key,

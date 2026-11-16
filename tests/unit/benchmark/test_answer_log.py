@@ -7,9 +7,15 @@ from typing import Any, Dict, List
 
 import pandas as pd
 import pytest
+import torch
 
 from benchmark.base import Benchmark
-from benchmark.utils.answer_log import LoggedAdapter, context_hash, request_key
+from benchmark.utils.answer_log import (
+    LoggedAdapter,
+    context_hash,
+    request_key,
+    request_seed,
+)
 from sparse_attention_hub.adapters.base import Request, RequestResponse
 
 RUN: Dict[str, Any] = {"model": "a-model", "attention": "dense", "subsets": ["x"]}
@@ -271,3 +277,69 @@ class TestRecorder:
         adapter.process_request(_request(), {}, {})
         assert adapter.measured == {}
         assert "measured" not in json.loads(open(path).readlines()[1])
+
+
+class DrawingAdapter(CountingAdapter):
+    """Answers with a number from torch's generator, as a sampling masker draws them."""
+
+    def process_request(
+        self,
+        request: Request,
+        generation_kwargs: Dict[str, Any],
+        request_kwargs: Dict[str, Any],
+    ) -> RequestResponse:
+        self.requests += 1
+        return RequestResponse(responses=[str(torch.rand(1).item())])
+
+
+class TestSeed:
+    def test_a_continued_run_draws_what_the_whole_run_drew(
+        self, tmp_path: Path
+    ) -> None:
+        requests: List[Request] = [_request(f"c{i}") for i in range(4)]
+        whole = LoggedAdapter(DrawingAdapter(), str(tmp_path / "whole"), RUN, seed=7)
+        expected = [whole.process_request(r, {}, {}).responses for r in requests]
+        assert len({answer[0] for answer in expected}) == 4  # a draw of its own each
+
+        path = str(tmp_path / "cut")
+        LoggedAdapter(DrawingAdapter(), path, RUN, seed=7).process_request(
+            requests[0], {}, {}
+        )
+        torch.rand(5)  # whatever else the process drew before it went on
+        inner = DrawingAdapter()
+        continued = LoggedAdapter(inner, path, RUN, seed=7)
+        answers = [continued.process_request(r, {}, {}).responses for r in requests]
+        assert answers == expected
+        assert inner.requests == 3
+
+    def test_the_order_of_the_requests_does_not_matter(self, tmp_path: Path) -> None:
+        requests: List[Request] = [_request(f"c{i}") for i in range(3)]
+        forward = LoggedAdapter(DrawingAdapter(), str(tmp_path / "a"), RUN, seed=7)
+        backward = LoggedAdapter(DrawingAdapter(), str(tmp_path / "b"), RUN, seed=7)
+        first = [forward.process_request(r, {}, {}).responses for r in requests]
+        second = [backward.process_request(r, {}, {}).responses for r in requests[::-1]]
+        assert first == second[::-1]
+
+    def test_another_seed_draws_other_numbers(self, tmp_path: Path) -> None:
+        one = LoggedAdapter(DrawingAdapter(), str(tmp_path / "a"), RUN, seed=7)
+        two = LoggedAdapter(DrawingAdapter(), str(tmp_path / "b"), RUN, seed=8)
+        assert (
+            one.process_request(_request(), {}, {}).responses
+            != two.process_request(_request(), {}, {}).responses
+        )
+        key: str = request_key(_request(), {}, {})
+        assert request_seed(7, key) != request_seed(8, key)
+        assert 0 <= request_seed(2**62, "f" * 64) < 2**63
+
+    def test_without_a_seed_the_generator_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seeded: List[int] = []
+        monkeypatch.setattr(torch, "manual_seed", seeded.append)
+        adapter = LoggedAdapter(DrawingAdapter(), str(tmp_path / "a"), RUN)
+        adapter.process_request(_request(), {}, {})
+        assert seeded == []
+        LoggedAdapter(
+            DrawingAdapter(), str(tmp_path / "b"), RUN, seed=3
+        ).process_request(_request(), {}, {})
+        assert seeded == [request_seed(3, request_key(_request(), {}, {}))]

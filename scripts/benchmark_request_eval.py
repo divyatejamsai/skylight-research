@@ -28,6 +28,10 @@ context_hash, the first 16 hex digits of the SHA-256 of the context), so that tw
 be compared prompt by prompt (scripts/benchmark_paired_stats.py); the runner's
 raw_results.csv, which repeats every context, is removed unless --keep_raw.
 
+Maskers that draw random numbers (AdaptiveSamplingMaskerConfig and the other sampling
+maskers) need --seed: torch is seeded from it and from the request before every request,
+so that a run gives the same answers again, also when it is continued.
+
 A run can be interrupted. Every answer is appended to answers.jsonl in the output
 directory as it arrives (benchmark/utils/answer_log.py), and the same command run again
 answers only the requests that are not in it. A directory that already has summary.json
@@ -45,7 +49,7 @@ Example:
 import json
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import fire
 import numpy as np
@@ -92,6 +96,7 @@ def main(
     maskers: str = "",
     decode_only: bool = False,
     micro_metrics: str = "",
+    seed: Optional[int] = None,
     max_new_tokens: int = 0,
     max_requests: int = 0,
     skip_requests: int = 0,
@@ -163,6 +168,8 @@ def main(
         run["skip_requests"] = skip_requests
     if measured:
         run["micro_metrics"] = measured
+    if seed is not None:
+        run["seed"] = seed
     ensure_benchmarks_loaded()
     bench = create_benchmark_instance(benchmark, subset_list or None)
     if skip_requests:
@@ -187,6 +194,7 @@ def main(
         f"{out}/answers.jsonl",
         run,
         MicroMetricMeter(measured, f"{out}/micro") if measured else None,
+        seed,
     )
     if len(adapter):
         print(
