@@ -292,6 +292,41 @@ class TestGraphDecodeOnCPU:
                 )
         forward.assert_not_called()
 
+    def test_micro_metrics_are_refused(self, micro_metric_log: Any) -> None:
+        # A replayed step runs no Python, so it could not log what was asked for.
+        micro_metric_log("research_attention_density")
+        model = _model()
+        adapter = _adapter(model, TwoStageBlockSparseConfig())
+        with patch.object(model, "forward", wraps=model.forward) as forward:
+            with pytest.raises(NotImplementedError, match="micro-metrics"):
+                _generate(adapter, _request(), max_new_tokens=6, graph_decode=True)
+        forward.assert_not_called()
+        # Dense decoding logs none: it is not stopped.
+        dense = _generate(
+            _adapter(model), _request(), max_new_tokens=6, graph_decode=True
+        )
+        assert len(_ids(dense)) == 6
+
+    def test_eager_loop_logs_every_layer_of_every_call(
+        self, micro_metric_log: Any
+    ) -> None:
+        records = micro_metric_log("research_attention_density")
+        model = _model()
+        adapter = _adapter(model, TwoStageBlockSparseConfig())
+        _generate(adapter, _request(n_context=40, n_question=6), max_new_tokens=4)
+        got = [(r["value"], r["metadata"]) for r in records()]
+        # The question in one call, then three decode steps; two layers each. On CPU
+        # the attention is dense, and the cache grows by the tokens of each call (the
+        # adapter adds a separator of its own to the 40 tokens of the context).
+        n = got[0][1]["k_len"]
+        assert n >= 46
+        calls = [(6, n), (1, n + 1), (1, n + 2), (1, n + 3)]
+        assert got == [
+            (1.0, {"layer_idx": layer, "q_len": q_len, "k_len": k_len})
+            for q_len, k_len in calls
+            for layer in range(2)
+        ]
+
     def test_hybrid_is_refused(self) -> None:
         model = _model()
         adapter = _adapter(model, hybrid=True)

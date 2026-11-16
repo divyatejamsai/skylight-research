@@ -15,6 +15,8 @@ from sparse_attention_hub.sparse_attention import (
 )
 from sparse_attention_hub.sparse_attention.efficient_attention.implementations.two_stage_block_sparse import (
     CARRY_KEY,
+    DENSITY_METRIC,
+    ERROR_METRIC,
     META_KEY,
 )
 from sparse_attention_hub.sparse_attention.utils.mask_attention_utils import (
@@ -47,10 +49,11 @@ def _call(attn, q, k, v, meta, layer_idx=0, mask=None, **kw):
     )
 
 
-def _kernel_reference(c, q, k, v, cap, carry_score=None):
+def _kernel_reference(c, q, k, v, cap, carry_score=None, selection=False):
     """The selection and decode kernels on fresh metadata for k/v (the live tokens) in
     buffers of capacity cap (the selection cap is a fraction of the capacity's blocks).
     carry_score: carried block scores to select with (updated in place).
+    selection: return the selected blocks (indices and counts) instead of the output.
     """
     from sparse_attention_hub.kernels.block_sparse_decode import (
         block_min_max,
@@ -92,6 +95,8 @@ def _kernel_reference(c, q, k, v, cap, carry_score=None):
         carry_score=carry_score,
         carry_threshold=c.carry_threshold,
     )
+    if selection:
+        return sel[0], sel[1]
     return block_sparse_decode_fused(
         q[:, :, 0].contiguous(),
         k,
@@ -692,3 +697,124 @@ class TestCarryScore:
         c = TwoStageBlockSparseConfig()
         assert c.carry_threshold == 0.0 and c.carry_decay == 0.9
         assert c.carry_per_layer is False
+
+
+def _every_block():
+    # Prefilter, TopCdf and cap all at 100%: every block is attended.
+    return TwoStageBlockSparse.create_from_config(
+        TwoStageBlockSparseConfig(
+            cdf_threshold=1.0,
+            floor_fraction=0.0,
+            max_fraction=1.0,
+            prefilter_fraction=1.0,
+        )
+    )
+
+
+def _logged(records):
+    return [(r["metric"], r["value"], r["metadata"]) for r in records]
+
+
+@pytest.mark.unit
+class TestMicroMetrics:
+    """Density and output error, logged as ResearchAttention logs a masker's."""
+
+    def test_nothing_is_logged_unless_enabled(self, micro_metric_log):
+        records = micro_metric_log()
+        attn = TwoStageBlockSparse.create_from_config(TwoStageBlockSparseConfig())
+        q, k, v = _qkv(2, 8, 2, 300, lq=5)
+        _call(attn, q, k, v, {})
+        assert records() == []
+
+    @pytest.mark.parametrize("lq", [1, 5])
+    def test_dense_calls_log_full_density_and_no_error(self, micro_metric_log, lq):
+        records = micro_metric_log(DENSITY_METRIC, ERROR_METRIC)
+        attn = TwoStageBlockSparse.create_from_config(TwoStageBlockSparseConfig())
+        q, k, v = _qkv(2, 8, 2, 300, lq=lq)
+        _call(attn, q, k, v, {}, layer_idx=3)
+        metadata = {"layer_idx": 3, "q_len": lq, "k_len": 300}
+        assert _logged(records()) == [
+            (DENSITY_METRIC, 1.0, metadata),
+            (ERROR_METRIC, 0.0, metadata),
+        ]
+
+    def test_only_the_enabled_metric_is_logged(self, micro_metric_log):
+        records = micro_metric_log(ERROR_METRIC)
+        attn = TwoStageBlockSparse.create_from_config(TwoStageBlockSparseConfig())
+        q, k, v = _qkv(1, 8, 2, 300, lq=4)
+        _call(attn, q, k, v, {})
+        assert [r["metric"] for r in records()] == [ERROR_METRIC]
+
+    @cuda
+    def test_every_block_is_a_density_of_one(self, micro_metric_log):
+        # 4000 tokens: the last block holds 32 of them, so whole blocks would give
+        # more than 1.
+        records = micro_metric_log(DENSITY_METRIC, ERROR_METRIC)
+        q, k, v = _qkv(2, 16, 4, 4000, device="cuda", dtype=torch.bfloat16)
+        _call(_every_block(), q, k, v, {})
+        density, error = records()
+        assert density["value"] == 1.0
+        assert density["metadata"] == {"layer_idx": 0, "q_len": 1, "k_len": 4000}
+        assert 0.0 <= error["value"] < 1e-2
+
+    @cuda
+    def test_sparse_step_counts_the_tokens_of_its_blocks(self, micro_metric_log):
+        records = micro_metric_log(DENSITY_METRIC, ERROR_METRIC)
+        c = TwoStageBlockSparseConfig()
+        attn = TwoStageBlockSparse.create_from_config(c)
+        n = 20017  # the last block holds 49 tokens
+        q, k, v = _qkv(1, 32, 8, n, device="cuda", dtype=torch.bfloat16)
+        meta = {}
+        out, _ = _call(attn, q, k, v, meta)
+        density, error = records()
+        cap = meta[META_KEY][0]["k8"].shape[2]
+        idx, counts = _kernel_reference(c, q, k, v, cap, selection=True)
+        tokens = 0
+        for blocks in _block_sets(idx, counts)[0]:
+            assert len(set(blocks)) == len(blocks)
+            tokens += sum(min(64, n - 64 * block) for block in blocks)
+        assert density["value"] == pytest.approx(tokens / (8 * n), rel=1e-6)
+        assert 0.0 < density["value"] < 0.5
+        dense, _ = get_true_attention_output(nn.Module(), q, k, v, None, 1.0, 0.0)
+        expected = torch.norm(dense.float() - out.float()) / torch.norm(dense.float())
+        assert error["value"] == pytest.approx(float(expected), rel=1e-3)
+        assert error["value"] > 0.0
+
+    @cuda
+    def test_static_cache_counts_its_live_tokens(self, micro_metric_log):
+        records = micro_metric_log(DENSITY_METRIC, ERROR_METRIC)
+        setup = TestStaticCache()
+        q, k, v, kbuf, vbuf = setup._setup()
+        pos = torch.tensor([setup.N0], device="cuda")
+        _static_step(_every_block(), q, kbuf, vbuf, k, v, {}, pos)
+        density, error = records()
+        assert density["value"] == 1.0
+        assert density["metadata"]["k_len"] == setup.N0 + 1
+        # Against dense attention over the live tokens, not the whole buffer.
+        assert 0.0 <= error["value"] < 1e-2
+
+    @cuda
+    def test_dense_decode_below_min_cached_tokens_logs_one(self, micro_metric_log):
+        records = micro_metric_log(DENSITY_METRIC)
+        attn = TwoStageBlockSparse.create_from_config(
+            TwoStageBlockSparseConfig(min_cached_tokens=5000)
+        )
+        q, k, v = _qkv(1, 16, 4, 4000, device="cuda", dtype=torch.bfloat16)
+        _call(attn, q, k, v, {})
+        assert _logged(records()) == [
+            (DENSITY_METRIC, 1.0, {"layer_idx": 0, "q_len": 1, "k_len": 4000})
+        ]
+
+    @cuda
+    def test_a_captured_step_cannot_log(self, micro_metric_log):
+        micro_metric_log(DENSITY_METRIC)
+        attn = TwoStageBlockSparse.create_from_config(TwoStageBlockSparseConfig())
+        setup = TestStaticCache()
+        q, k, v, kbuf, vbuf = setup._setup()
+        meta = {}
+        pos = torch.tensor([setup.N0], device="cuda")
+        _static_step(attn, q, kbuf, vbuf, k, v, meta, pos)  # eager: logs
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(NotImplementedError, match="without graph_decode"):
+            with torch.cuda.graph(graph):
+                _static_step(attn, q, kbuf, vbuf, k, v, meta, pos)

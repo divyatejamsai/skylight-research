@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch import nn
 
+from ....metric_logging.logger import MicroMetricLogger
 from ...utils.mask_attention_utils import get_true_attention_output
 from ..base import EfficientAttention, EfficientAttentionConfig, SparseAttentionConfig
 
@@ -14,6 +15,10 @@ META_KEY = "two_stage_block_sparse"
 CARRY_KEY = "two_stage_block_sparse_carry"
 # The kernels take the query-key products with Triton's dot, which needs 16 columns.
 MIN_HEAD_DIM = 16
+# ResearchAttention's micro-metrics (registered there), logged here under the same
+# names and metadata, so that a run of this attention reads like a masker's.
+DENSITY_METRIC = "research_attention_density"
+ERROR_METRIC = "research_attention_output_error"
 
 
 @dataclass
@@ -94,11 +99,23 @@ class TwoStageBlockSparse(EfficientAttention):
     Below config.min_cached_tokens cached tokens, decode steps run dense (no metadata is
     kept meanwhile): per step on a growing cache, and once per sequence, at its first
     decode step, on a static one.
+
+    Micro-metrics: with research_attention_density or research_attention_output_error
+    enabled in MicroMetricLogger, every call logs them with ResearchAttention's
+    metadata (layer_idx, q_len, k_len). The density of a sparse decode step is the
+    share of the cached tokens that lie in the selected blocks, averaged over KV heads
+    (every query head of a group attends its KV head's blocks, so this is the density
+    of the equivalent mask; the tail's pseudo-tokens are not counted). The error is the
+    relative L2 error of the step's output against dense attention, which costs one
+    dense attention per call. Dense calls log 1.0 and 0.0. Logging reads values back
+    to the host, which a CUDA graph cannot capture: decode eagerly to log.
     """
 
     # ModelAdapterHF's static-cache decode path (generation_kwargs["graph_decode"]) may
     # use this attention: see "Static caches" above.
     supports_static_cache_decode: bool = True
+    # What this attention logs when enabled; ModelAdapterHF refuses graph_decode then.
+    micro_metrics: Tuple[str, ...] = (DENSITY_METRIC, ERROR_METRIC)
 
     def __init__(
         self,
@@ -153,6 +170,7 @@ class TwoStageBlockSparse(EfficientAttention):
         layer_idx: Any = kwargs.get("layer_idx", 0)
         state = self._layer_state(sparse_meta_data, layer_idx)
         position_ids: Any = kwargs.get("position_ids")
+        logged: Tuple[str, ...] = self._logged_metrics()
         if state.get("static") and not state["dense"] and queries.shape[2] > 1:
             # Tokens a multi-token call wrote into the static cache: fold them in while
             # eager (decode steps only append their own token).
@@ -164,6 +182,8 @@ class TwoStageBlockSparse(EfficientAttention):
                 int(position_ids[0, -1]) + 1,
             )
         if queries.shape[2] != 1 or not queries.is_cuda:
+            if logged:
+                self._log(logged, 1.0, 0.0, layer_idx, queries, keys, position_ids)
             return get_true_attention_output(
                 module,
                 queries,
@@ -179,6 +199,13 @@ class TwoStageBlockSparse(EfficientAttention):
             raise NotImplementedError(
                 f"TwoStageBlockSparse needs a head dimension of at least {MIN_HEAD_DIM}, "
                 f"and this model has {queries.shape[-1]}."
+            )
+
+        if logged and torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "TwoStageBlockSparse cannot log micro-metrics from a decode step that "
+                "is being captured in a CUDA graph: decode without graph_decode to "
+                f"log {', '.join(logged)}."
             )
 
         from ....kernels.block_sparse_decode import (
@@ -208,6 +235,8 @@ class TwoStageBlockSparse(EfficientAttention):
             not state.get("static")
             and keys.shape[0] * keys.shape[2] < c.min_cached_tokens
         ):
+            if logged:
+                self._log(logged, 1.0, 0.0, layer_idx, queries, keys, position_ids)
             return self._dense_decode(queries, keys, values, attention_mask, scaling)
         if state.get("static"):
             # The cache already holds the token at its position: one append kernel reads
@@ -288,7 +317,87 @@ class TwoStageBlockSparse(EfficientAttention):
         out = block_sparse_decode_fused(
             q, keys, values, sel[0], sel[1], c.block_size, seq_len=seq_len, tail=tail
         )
+        if logged:
+            n_live = int(seq_len)
+            error = 0.0
+            if ERROR_METRIC in logged:
+                dense, _ = get_true_attention_output(
+                    module,
+                    queries,
+                    keys[:, :, :n_live],
+                    values[:, :, :n_live],
+                    None,
+                    scaling,
+                    dropout,
+                )
+                dense = dense.float()
+                error = float(
+                    torch.norm(dense - out.unsqueeze(1).float()) / torch.norm(dense)
+                )
+            self._log(
+                logged,
+                self._density(sel[0], sel[1], n_live),
+                error,
+                layer_idx,
+                queries,
+                keys,
+                position_ids,
+            )
         return out.unsqueeze(1), None
+
+    @staticmethod
+    def _logged_metrics() -> Tuple[str, ...]:
+        """Those of this attention's micro-metrics that are enabled."""
+        logger = MicroMetricLogger()
+        return tuple(
+            name
+            for name in (DENSITY_METRIC, ERROR_METRIC)
+            if logger.is_metric_enabled(name)
+        )
+
+    @staticmethod
+    def _log(
+        logged: Tuple[str, ...],
+        density: float,
+        error: float,
+        layer_idx: Any,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        position_ids: Any,
+    ) -> None:
+        """Log one call's density and output error (those enabled), with the metadata
+        ResearchAttention gives them. k_len is the number of cached tokens: a static
+        cache is longer than its sequence, whose length the positions give."""
+        k_len: int = keys.shape[2]
+        if position_ids is not None:
+            k_len = min(k_len, int(position_ids[0, -1]) + 1)
+        logger = MicroMetricLogger()
+        for name, value in ((DENSITY_METRIC, density), (ERROR_METRIC, error)):
+            if name in logged:
+                logger.log(
+                    name,
+                    value,
+                    metadata={
+                        "layer_idx": layer_idx,
+                        "q_len": queries.shape[2],
+                        "k_len": k_len,
+                    },
+                )
+
+    def _density(
+        self, block_idx: torch.Tensor, counts: torch.Tensor, n_live: int
+    ) -> float:
+        """The share of the n_live cached tokens that lie in the selected blocks,
+        averaged over batch rows and KV heads.
+
+        block_idx: [B, Hkv, cap], of which the first counts [B, Hkv] slots are the
+        selected blocks. The last block of the sequence may be partly filled.
+        """
+        bs = self.config.block_size
+        slot = torch.arange(block_idx.shape[-1], device=block_idx.device)
+        tokens = (n_live - block_idx.long() * bs).clamp(min=0, max=bs)
+        tokens = tokens.masked_fill(slot >= counts.unsqueeze(-1), 0)
+        return float(tokens.sum()) / float(counts.numel() * n_live)
 
     @staticmethod
     def _dense_decode(

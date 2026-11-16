@@ -11,6 +11,7 @@ from transformers import StaticCache
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from ..metric_logging.logger import MicroMetricLogger
 from ..sparse_attention.base import SparseAttention, SparseAttentionConfig
 from ..sparse_attention.efficient_attention.base import EfficientAttention
 from ..sparse_attention.research_attention.base import ResearchAttention
@@ -688,3 +689,13 @@ class ModelAdapterHF(ModelAdapter):
                 f"{type(self.sparse_attention).__name__} does not support graph_decode: "
                 "it needs an attention with supports_static_cache_decode"
             )
+        if self._sparse_attention_available:
+            logged = set(getattr(self.sparse_attention, "micro_metrics", ())) & (
+                MicroMetricLogger().get_enabled_metrics()
+            )
+            if logged:
+                raise NotImplementedError(
+                    "graph_decode replays captured decode steps, which cannot log "
+                    f"micro-metrics ({', '.join(sorted(logged))} enabled): decode "
+                    "without graph_decode to log them"
+                )
