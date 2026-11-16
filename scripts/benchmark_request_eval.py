@@ -251,8 +251,10 @@ def main(
     if measured:
         summary["micro_metric_means"] = means
     print(json.dumps(summary, indent=2, default=str))
-    with open(f"{out}/summary.json", "w") as f:
+    # summary.json marks the directory as complete: it appears whole or not at all.
+    with open(f"{out}/summary.json.part", "w") as f:
         json.dump(summary, f, indent=2, default=str)
+    os.replace(f"{out}/summary.json.part", f"{out}/summary.json")
 
 
 if __name__ == "__main__":
