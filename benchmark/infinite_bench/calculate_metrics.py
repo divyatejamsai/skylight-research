@@ -12,10 +12,61 @@ from collections import Counter
 from tqdm import tqdm
 
 
+# The tasks whose answer is one of four lettered options.
+CHOICE_TASKS = ("code_debug", "longbook_choice_eng")
+# The tasks whose answer is a number.
+NUMBER_TASKS = ("code_run", "math_find")
+
+
+def _option_text(question: str, letter: str):
+    """The text of one option of a question ("B. repack_carchive"), or None."""
+    match = re.search(rf"^{re.escape(letter)}\. (.+)$", question, flags=re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _number(text):
+    """ "88" -> 88 and "3.5" -> 3.5, as the original data stores them."""
+    text = str(text).strip()
+    try:
+        return int(text)
+    except ValueError:
+        return float(text)
+
+
+def label_for_scorer(answer, question: str, task: str) -> list:
+    """The answer of one row in the form the scorers below were written for.
+
+    The dataset on the Hub (create_huggingface_dataset.py) stores every answer as a
+    sequence of strings, which a dataframe returns as a numpy array, and for the two
+    multiple-choice tasks only the letter of the correct option. The scorers are the
+    original InfiniteBench ones. They take a list, compare the answers of code_run and
+    math_find as numbers, and for the multiple-choice tasks take the text of the option
+    followed by its letter (the text is read back from the question).
+    """
+    if isinstance(answer, str) or not hasattr(answer, "__iter__"):
+        label = [answer]
+    else:
+        label = list(answer)
+    if task in NUMBER_TASKS:
+        return [_number(item) for item in label]
+    if task in CHOICE_TASKS and len(label) == 1:
+        letter = str(label[0])
+        text = _option_text(str(question), letter)
+        if text is not None:
+            return [text, letter]
+        if task == "code_debug":  # its scorer reads both entries
+            return [letter, letter]
+    return label
+
+
 def calculate_metrics(df):
     preds = df["predicted_answer"].tolist()
-    labels = df["answer"].tolist()
     task = df["task"].tolist()[0]
+    questions = df["question"].tolist() if "question" in df.columns else [""] * len(df)
+    labels = [
+        label_for_scorer(answer, question, task)
+        for answer, question in zip(df["answer"].tolist(), questions)
+    ]
     model = "dummy_model"  # not really used
     return get_score(labels, preds, task, model)
 
@@ -236,7 +287,8 @@ def get_score_one_math_find(pred, label, model_name: str) -> bool:
         if first_num is None:
             return False
         first_num = first_num.group(0).strip()
-        return int(first_num) == label
+        # float, not int: int("88.0") raises, and one such prediction would fail the task
+        return float(first_num) == label
     elif isinstance(label, float):
         # Find first float or int
         first_float = re.search(r"\d+\.\d+|\d+", pred)

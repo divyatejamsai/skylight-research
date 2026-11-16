@@ -8,6 +8,8 @@ from .efficient_attention.implementations import (
     DoubleSparsityConfig,
     HashAttention,
     HashAttentionConfig,
+    TwoStageBlockSparse,
+    TwoStageBlockSparseConfig,
 )
 from .metadata import SparseAttentionMetadata
 from .research_attention import ResearchAttention, ResearchAttentionConfig
@@ -47,6 +49,8 @@ __all__ = [
     "HashAttention",
     "DoubleSparsityConfig",
     "HashAttentionConfig",
+    "TwoStageBlockSparse",
+    "TwoStageBlockSparseConfig",
     "ChannelConfig",
     "DoubleSparsityTopKMaskerConfig",
     "HashAttentionTopKMaskerConfig",

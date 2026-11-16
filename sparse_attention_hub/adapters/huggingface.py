@@ -2,16 +2,20 @@
 
 import random
 import string
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
+from transformers import StaticCache
 from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+from ..metric_logging.logger import MicroMetricLogger
 from ..sparse_attention.base import SparseAttention, SparseAttentionConfig
+from ..sparse_attention.efficient_attention.base import EfficientAttention
 from ..sparse_attention.research_attention.base import ResearchAttention
+from . import static_decode
 from .base import ModelAdapter, Request, RequestResponse
 from .model_servers.huggingface import ModelServerHF
 from .utils.config import ModelServerConfig
@@ -127,10 +131,47 @@ class ModelAdapterHF(ModelAdapter):
 
         Args:
             request: The request to process
+            generation_kwargs: ``max_new_tokens``, and optionally ``graph_decode`` and
+                ``compile_layers``. With ``graph_decode=True`` the context is prefilled
+                once for all the questions and moved into a preallocated cache; each
+                question is added to it and answered there, the decode step replayed
+                from a CUDA graph (see ``_answer_on_static_cache``). It is the same
+                greedy decoding, without the per-step launch cost of the eager loop
+                and without a prefill per question. It needs dense attention or a
+                sparse attention with ``supports_static_cache_decode``. With
+                ``compile_layers=True`` as well, the decode steps run through
+                torch.compile'd decoder layers. The layers are compiled once per
+                model and process: at the first request, and once more at the first
+                request of another length.
 
         Returns:
             response: The response to the request
         """
+        compile_layers: bool = bool(generation_kwargs.get("compile_layers"))
+        if compile_layers and not generation_kwargs.get("graph_decode"):
+            raise ValueError("compile_layers needs graph_decode")
+        if generation_kwargs.get("graph_decode"):
+            # before the prefill, not after it
+            self._check_graph_decode(compile_layers)
+        if compile_layers and not static_decode.layers_compiled(self.model):
+            # dynamic=None: one more compilation when a second cache length arrives,
+            # then none (False compiles again for every length).
+            static_decode.compile_decoder_layers(self.model, dynamic=None)
+        # Compiled layers are for decode steps on a static cache: the prefill, the
+        # questions and the eager loop run them as plain modules.
+        with static_decode.layer_stance(self.model, "force_eager"):
+            return self._process_request(
+                request, generation_kwargs, request_kwargs, **kwargs
+            )
+
+    def _process_request(
+        self,
+        request: Request,
+        generation_kwargs: Dict[str, Any],
+        request_kwargs: Dict[str, Any],
+        **kwargs: Dict[str, Any],
+    ) -> RequestResponse:
+        """The body of ``process_request``, after its checks."""
         max_context_length: int = request_kwargs.get("max_context_length", INT_MAX)
         max_new_tokens: int = generation_kwargs.get("max_new_tokens", INT_MAX)
         print(
@@ -175,8 +216,29 @@ class ModelAdapterHF(ModelAdapter):
             context_tokens = context_tokens.to(input_device)
         print(f"Context tokens: {context_tokens.shape}")
         responses: List[str] = []
-
         self.model.eval()
+        if generation_kwargs.get("graph_decode"):
+            with torch.no_grad():
+                question_ids: List[torch.Tensor] = [
+                    self.tokenizer.encode(
+                        question, return_tensors="pt", add_special_tokens=False
+                    ).to(context_tokens.device)
+                    for question in questions
+                ]
+                new_tokens: int = generation_kwargs.get("max_new_tokens", 50)
+                room: int = max(ids.shape[1] for ids in question_ids) + new_tokens
+                cache = self._prefill_static_cache(context_tokens, room)
+                responses = [
+                    self._answer_on_static_cache(
+                        cache,
+                        context_tokens.shape[1],
+                        ids,
+                        new_tokens,
+                        compiled=bool(generation_kwargs.get("compile_layers")),
+                    )
+                    for ids in question_ids
+                ]
+            questions = []  # answered above
         with torch.no_grad():
             for question in questions:
                 sparse_meta_data: Dict[str, Any] = {}
@@ -339,7 +401,9 @@ class ModelAdapterHF(ModelAdapter):
             ALL_ATTENTION_FUNCTIONS.register(
                 self._registered_attention_name, self._custom_attention_fn
             )
-            if isinstance(self.sparse_attention, ResearchAttention):
+            if isinstance(
+                self.sparse_attention, (ResearchAttention, EfficientAttention)
+            ):
                 ALL_MASK_ATTENTION_FUNCTIONS.register(
                     self._registered_attention_name, eager_mask
                 )
@@ -508,3 +572,130 @@ class ModelAdapterHF(ModelAdapter):
         )
 
         return answer
+
+    def _prefill_static_cache(
+        self, context_tokens: torch.Tensor, room: int
+    ) -> StaticCache:
+        """Prefill the context densely and move its cache into a StaticCache.
+
+        Args:
+            context_tokens: [1, n] context token ids.
+            room: Tokens that will be written after the context (the longest question
+                and its answer).
+
+        Returns:
+            The static cache, holding the context.
+        """
+        prefill_kwargs: Dict[str, Any] = {"logits_to_keep": 1}
+        if self._sparse_attention_available:
+            prefill_kwargs["sparse_meta_data"] = {}
+        outputs = self.model(
+            context_tokens, past_key_values=None, use_cache=True, **prefill_kwargs
+        )
+        # The prefill cache is emptied layer by layer as it is copied: the peak is one
+        # cache and one layer, not two caches.
+        return static_decode.move_to_static_cache(
+            self.model.config,
+            outputs.past_key_values,
+            context_tokens.shape[1],
+            room + static_decode.CACHE_MARGIN,
+        )
+
+    def _answer_on_static_cache(
+        self,
+        cache: StaticCache,
+        n_context: int,
+        question_tokens: torch.Tensor,
+        max_new_tokens: int,
+        compiled: bool = False,
+    ) -> str:
+        """Add one question to a prefilled context and generate its answer.
+
+        The question's tokens are written after the context (eagerly, in one forward),
+        then the answer is decoded by ``static_decode.decode_on_static_cache``. Nothing
+        an earlier question left in the cache is attended: every step sees the slots up
+        to its own position only, and a sparse attention starts from a new state.
+
+        Args:
+            cache: The static cache holding the context (``_prefill_static_cache``).
+            n_context: Tokens of context in it.
+            question_tokens: [1, q] question token ids.
+            max_new_tokens: Largest number of tokens to generate.
+            compiled: Run the decode steps through the compiled decoder layers.
+
+        Returns:
+            The decoded answer.
+        """
+        if question_tokens.shape[1] == 0:
+            raise ValueError("Question tokens are empty; cannot generate response")
+        sparse: bool = self._sparse_attention_available
+        # Dense gets the engine's attention; a sparse attention is switched on here.
+        mode: Any = self.enable_sparse_mode() if sparse else nullcontext()
+        meta: Optional[Dict[Any, Any]] = {} if sparse else None
+        stop_token_ids: List[int] = static_decode.end_token_ids(self.model)
+        with mode:
+            logits = static_decode.forward_on_static_cache(
+                self.model,
+                cache,
+                question_tokens,
+                n_context,
+                attention=nullcontext() if sparse else None,
+                sparse_meta_data=meta,
+            )
+            generated: List[torch.Tensor] = [logits.argmax()]
+            if max_new_tokens > 1:
+                stance: Any = (
+                    static_decode.layer_stance(self.model, "default")
+                    if compiled
+                    else nullcontext()
+                )
+                with stance:
+                    out = static_decode.decode_on_static_cache(
+                        self.model,
+                        cache,
+                        generated[0],
+                        n_context + question_tokens.shape[1],
+                        max_new_tokens - 1,
+                        attention=nullcontext() if sparse else None,
+                        sparse_meta_data=meta,
+                        stop_token_ids=stop_token_ids,
+                        opaque_attention=compiled,
+                    )
+                generated += list(out.tokens[0].unbind(0))
+        answer: str = self.tokenizer.decode(
+            torch.stack(generated), skip_special_tokens=True
+        )
+        return answer
+
+    def _check_graph_decode(self, compile_layers: bool = False) -> None:
+        """Raise NotImplementedError if this adapter cannot decode with graph_decode
+        (and, when asked for, with compiled decoder layers)."""
+        if compile_layers:
+            if next(self.model.parameters()).device.type != "cuda":
+                raise NotImplementedError("compile_layers needs the model on a GPU")
+            if not static_decode.can_compile_layers(self.model):
+                raise NotImplementedError(
+                    "compile_layers needs torch.compiler.set_stance (PyTorch 2.6 or "
+                    "later) and a model with its decoder layers in model.model.layers"
+                )
+        if self.hybrid:
+            raise NotImplementedError(
+                "graph_decode does not support hybrid models (token-by-token prefill)"
+            )
+        if self._sparse_attention_available and not getattr(
+            self.sparse_attention, "supports_static_cache_decode", False
+        ):
+            raise NotImplementedError(
+                f"{type(self.sparse_attention).__name__} does not support graph_decode: "
+                "it needs an attention with supports_static_cache_decode"
+            )
+        if self._sparse_attention_available:
+            logged = set(getattr(self.sparse_attention, "micro_metrics", ())) & (
+                MicroMetricLogger().get_enabled_metrics()
+            )
+            if logged:
+                raise NotImplementedError(
+                    "graph_decode replays captured decode steps, which cannot log "
+                    f"micro-metrics ({', '.join(sorted(logged))} enabled): decode "
+                    "without graph_decode to log them"
+                )

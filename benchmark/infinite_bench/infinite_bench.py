@@ -87,8 +87,10 @@ class InfiniteBench(Benchmark):
 
         Returns:
             Dictionary containing computed metrics:
-            - overall_score: Average score across all tasks
-            - task_scores: Individual scores for each task
+            - overall_score: Average score across the tasks that were scored
+            - task_scores: Individual scores for each task that was scored
+            - failed_tasks: The error of each task whose scoring raised. Such a task
+              has no entry in task_scores: a 0.0 there would read as the model's score.
         """
         if len(results_df) == 0:
             return {"error": "No results to evaluate"}
@@ -96,28 +98,29 @@ class InfiniteBench(Benchmark):
         # Group results by task
         task_groups = results_df.groupby("task")
         task_scores: Dict[str, float] = {}
-        all_scores: List[float] = []
-        
+        failed_tasks: Dict[str, str] = {}
+
         for task_name, task_df in task_groups:
             try:
                 # Use the calculate_metrics function from HashAttention evaluation
                 score: float = calculate_metrics(task_df)
                 task_scores[task_name] = score
-                all_scores.append(score)
                 print(f"  ✓ {task_name}: {score:.4f}")
-                    
+
             except Exception as e:
-                print(f"Error evaluating task {task_name}: {str(e)}")
-                task_scores[task_name] = 0.0
+                print(f"  ❌ Error evaluating task {task_name}: {str(e)}")
+                failed_tasks[task_name] = f"{type(e).__name__}: {e}"
 
         # Compute overall metrics
+        all_scores: List[float] = list(task_scores.values())
         overall_score = sum(all_scores) / len(all_scores) if all_scores else 0.0
-        
+
         overall_metrics: Dict[str, Any] = {
             "overall_score": round(overall_score, 4),
             "task_scores": {task: round(score, 4) for task, score in task_scores.items()},
+            "failed_tasks": failed_tasks,
             "summary": {
-                "total_tasks": len(task_scores),
+                "total_tasks": len(task_scores) + len(failed_tasks),
                 "total_samples": len(results_df)
             }
         }

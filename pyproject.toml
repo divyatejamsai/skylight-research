@@ -179,3 +179,12 @@ module = [
 ignore_missing_imports = true
 ignore_errors = true
 follow_imports = "skip"
+
+# Triton kernels are written in Triton's language: their parameters are pointers and
+# compile-time constants, and Triton reads an annotation as a kernel parameter type. The
+# Python functions of the module are annotated; the kernels cannot be.
+[[tool.mypy.overrides]]
+module = ["sparse_attention_hub.kernels.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false

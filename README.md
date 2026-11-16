@@ -87,6 +87,7 @@ The framework supports various state-of-the-art sparse attention mechanisms:
 - **HashAttention** (Desai et al. 2024): Hash-based attention selection
 - **vAttention** (Desai et al. 2025): Adaptive sampling mechanisms
 - **MagicPig** (Chen et al. 2024): LSH-based similarity sampling
+- **TwoStageBlockSparse**: block-sparse decode attention with Triton kernels, faster than dense decoding from about 32k cached tokens ([details](docs/performance/BLOCK_SPARSE_DECODE.md))
 - **Oracle-based methods**: Research-only mechanisms using ground truth attention
 
 For comprehensive examples and detailed masker implementations, see the [Research Attention README](sparse_attention_hub/sparse_attention/research_attention/README.md).
@@ -274,6 +275,7 @@ pytest -m integration   # Integration tests
 - [Adapters Module](sparse_attention_hub/adapters/README.md) - Model integration and HuggingFace support
 - [Research Attention](sparse_attention_hub/sparse_attention/research_attention/README.md) - Sparse attention mechanisms and maskers
 - [Ray Tune Optimization](benchmark/raytune/README.md) - Hyperparameter optimization and search
+- [Block-sparse decode attention](docs/performance/BLOCK_SPARSE_DECODE.md) - `TwoStageBlockSparse` and the `graph_decode` option of `process_request`
 
 
 ## Research 
